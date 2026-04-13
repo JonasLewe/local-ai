@@ -144,25 +144,34 @@ get_model_size_gb() {
   echo "${MODEL_SIZE_GB:-16}"
 }
 
-# Refuse to proceed if not enough RAM for model + 4GB buffer
+# Three-tier memory check:
+#   available >= model + 2GB  → comfortable, proceed silently
+#   available >= model        → tight, macOS will swap inactive pages, warn
+#   available <  model        → impossible, refuse hard
+# Note: the REAL crash safety is check_no_competing_servers — RAM math
+# alone can't catch the scenario where two model servers load the same model.
 preflight_memory_check() {
   local needed_gb; needed_gb=$(get_model_size_gb)
-  local buffer_gb=4
-  local required=$((needed_gb + buffer_gb))
+  local comfortable=$((needed_gb + 2))
   local available; available=$(get_available_ram_gb)
 
   step "Memory preflight check"
   info "Model size:  ${needed_gb}GB (auto-detected)"
-  info "Required:    ${required}GB (model + ${buffer_gb}GB buffer)"
-  info "Available:   ${available}GB"
+  info "Available:   ${available}GB free + inactive"
 
-  if [[ "$available" -lt "$required" ]]; then
+  if [[ "$available" -lt "$needed_gb" ]]; then
     error "INSUFFICIENT MEMORY — refusing to proceed"
+    error "  Available (${available}GB) is below model size (${needed_gb}GB)."
+    error "  The model literally cannot fit. ABORTING for your safety."
     error "  Free up RAM by closing applications, or use a smaller model."
-    error "  Current state risks system freeze. ABORTING for your safety."
     exit 1
+  elif [[ "$available" -lt "$comfortable" ]]; then
+    warn "Tight: ${available}GB available, ${needed_gb}GB needed (no buffer)"
+    warn "  macOS will swap inactive pages — this may slow things down briefly."
+    warn "  Closing some apps would help. Proceeding anyway."
+  else
+    success "Memory check passed (${available}GB available, ${needed_gb}GB needed)"
   fi
-  success "Memory check passed"
 }
 
 # Refuse to start Ollama if LM Studio still has models in RAM
