@@ -51,6 +51,19 @@ readonly MODEL_CONTEXT_LENGTH="${MODEL_CONTEXT_LENGTH:-32768}"
 readonly OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-0}"
 readonly OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-f16}"
 
+# --- RAG / Document search defaults ---
+# bge-m3: multilingual (100+ langs incl. strong German), 8K ctx, 1.2GB — best
+# general-purpose embedding for mixed-language document collections.
+# Alternative: "nomic-embed-text" (English-first, 274MB, faster).
+readonly EMBEDDING_MODEL="${EMBEDDING_MODEL:-bge-m3}"
+# Reranker re-scores the top-K vector hits for much better retrieval precision.
+# Downloaded from HuggingFace on first use (~500MB, cached in container).
+readonly RERANKING_MODEL="${RERANKING_MODEL:-BAAI/bge-reranker-v2-m3}"
+readonly RAG_TOP_K="${RAG_TOP_K:-20}"
+readonly RAG_TOP_K_RERANKER="${RAG_TOP_K_RERANKER:-5}"
+readonly RAG_CHUNK_SIZE="${RAG_CHUNK_SIZE:-1500}"
+readonly RAG_CHUNK_OVERLAP="${RAG_CHUNK_OVERLAP:-200}"
+
 # Podman VM
 readonly PODMAN_CPUS="${PODMAN_CPUS:-6}"
 readonly PODMAN_MEMORY="${PODMAN_MEMORY:-4096}"
@@ -144,31 +157,33 @@ get_model_size_gb() {
   echo "${MODEL_SIZE_GB:-16}"
 }
 
-# Three-tier memory check:
+# Three-tier memory check (macOS unified memory, mmap-backed model loads):
 #   available >= model + 2GB  → comfortable, proceed silently
-#   available >= model        → tight, macOS will swap inactive pages, warn
-#   available <  model        → impossible, refuse hard
-# Note: the REAL crash safety is check_no_competing_servers — RAM math
-# alone can't catch the scenario where two model servers load the same model.
+#   available >= model - 4GB  → workable, macOS will swap <=4GB inactive pages, warn
+#   available <  model - 4GB  → too tight, heavy swap would thrash, refuse hard
+# The 4GB swap tolerance matches what LM Studio's users routinely ran on 32GB
+# systems without issue. The REAL crash safety is check_no_competing_servers —
+# RAM math alone can't catch two model servers loading the same model.
 preflight_memory_check() {
   local needed_gb; needed_gb=$(get_model_size_gb)
   local comfortable=$((needed_gb + 2))
+  local minimum=$((needed_gb - 4))
   local available; available=$(get_available_ram_gb)
 
   step "Memory preflight check"
   info "Model size:  ${needed_gb}GB (auto-detected)"
   info "Available:   ${available}GB free + inactive"
 
-  if [[ "$available" -lt "$needed_gb" ]]; then
+  if [[ "$available" -lt "$minimum" ]]; then
     error "INSUFFICIENT MEMORY — refusing to proceed"
-    error "  Available (${available}GB) is below model size (${needed_gb}GB)."
-    error "  The model literally cannot fit. ABORTING for your safety."
+    error "  Available (${available}GB) is far below model size (${needed_gb}GB)."
+    error "  Even with macOS swap the system would thrash. ABORTING."
     error "  Free up RAM by closing applications, or use a smaller model."
     exit 1
   elif [[ "$available" -lt "$comfortable" ]]; then
-    warn "Tight: ${available}GB available, ${needed_gb}GB needed (no buffer)"
-    warn "  macOS will swap inactive pages — this may slow things down briefly."
-    warn "  Closing some apps would help. Proceeding anyway."
+    warn "Tight: ${available}GB available, ${needed_gb}GB needed"
+    warn "  macOS will swap some inactive pages — may slow the first load briefly."
+    warn "  Proceeding (safe for deficits up to 4GB)."
   else
     success "Memory check passed (${available}GB available, ${needed_gb}GB needed)"
   fi
@@ -192,6 +207,38 @@ check_no_competing_servers() {
   success "No competing model servers running"
 }
 
+# Ensure Ollama server is reachable on $OLLAMA_PORT. If not, start it in the
+# background with the configured env vars. Used during install/start before
+# any command that talks to the Ollama API (list, pull, create, run).
+ensure_ollama_running() {
+  if curl -sf --max-time 1 "http://127.0.0.1:$OLLAMA_PORT/api/tags" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  step "Starting Ollama server"
+  mkdir -p "$LOG_DIR"
+  # Use `env` to set vars for the child only — OLLAMA_* are readonly in this shell
+  nohup env \
+    OLLAMA_HOST="127.0.0.1:$OLLAMA_PORT" \
+    OLLAMA_FLASH_ATTENTION="$OLLAMA_FLASH_ATTENTION" \
+    OLLAMA_KV_CACHE_TYPE="$OLLAMA_KV_CACHE_TYPE" \
+    ollama serve >>"$LOG_OLLAMA" 2>>"$LOG_OLLAMA_ERR" &
+  disown 2>/dev/null || true
+
+  local i
+  for i in {1..20}; do
+    if curl -sf --max-time 1 "http://127.0.0.1:$OLLAMA_PORT/api/tags" >/dev/null 2>&1; then
+      success "Ollama server reachable on 127.0.0.1:$OLLAMA_PORT"
+      return 0
+    fi
+    sleep 1
+  done
+
+  error "Ollama server failed to start within 20s"
+  error "  Check logs: $LOG_OLLAMA_ERR"
+  exit 1
+}
+
 check_prerequisites() {
   step "Checking prerequisites"
   require_macos
@@ -204,12 +251,52 @@ check_prerequisites() {
 }
 
 # ---------- Install steps ----------
+download_embedding_model() {
+  step "Checking embedding model: $EMBEDDING_MODEL"
+  if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$EMBEDDING_MODEL\(:latest\)\?"; then
+    success "Embedding model '$EMBEDDING_MODEL' already available"
+    return
+  fi
+  info "Pulling $EMBEDDING_MODEL from Ollama registry (used for document search)..."
+  if ollama pull "$EMBEDDING_MODEL"; then
+    success "Embedding model '$EMBEDDING_MODEL' ready"
+  else
+    die "Pull failed — verify model name at https://ollama.com/library"
+  fi
+}
+
 download_model() {
   step "Checking model: $MODEL_ID"
 
-  # Already in Ollama's library?
+  local already_present=0
   if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$MODEL_ID\(:latest\)\?"; then
-    success "Model '$MODEL_ID' already available in Ollama"
+    already_present=1
+
+    # Check whether the existing model's num_ctx matches the configured value.
+    # If it does, skip re-import. If not, rebuild the Modelfile with the new ctx.
+    local current_ctx
+    current_ctx=$(ollama show "$MODEL_ID" --modelfile 2>/dev/null \
+      | awk '/^PARAMETER +num_ctx/ {print $3; exit}')
+    if [[ "$current_ctx" == "$MODEL_CONTEXT_LENGTH" ]]; then
+      success "Model '$MODEL_ID' already available (context: $current_ctx tokens)"
+      return
+    fi
+    info "Model exists but num_ctx mismatch: current=$current_ctx, configured=$MODEL_CONTEXT_LENGTH"
+    info "Re-creating Modelfile to apply new context length (no re-download)"
+
+    # Re-create from existing Ollama-stored model — fast, disk-only operation
+    local modelfile; modelfile=$(mktemp)
+    cat > "$modelfile" <<EOF
+FROM $MODEL_ID
+PARAMETER num_ctx $MODEL_CONTEXT_LENGTH
+EOF
+    if ollama create "$MODEL_ID" -f "$modelfile" >/dev/null; then
+      success "Model '$MODEL_ID' context updated to $MODEL_CONTEXT_LENGTH tokens"
+    else
+      rm -f "$modelfile"
+      die "Re-create failed — check 'ollama show $MODEL_ID'"
+    fi
+    rm -f "$modelfile"
     return
   fi
 
@@ -303,10 +390,84 @@ setup_container() {
     -e OLLAMA_BASE_URL="http://host.containers.internal:$OLLAMA_PORT" \
     -e WEBUI_AUTH=true \
     -e ENABLE_OPENAI_API=false \
+    -e RAG_EMBEDDING_ENGINE=ollama \
+    -e RAG_EMBEDDING_MODEL="$EMBEDDING_MODEL" \
+    -e RAG_OLLAMA_BASE_URL="http://host.containers.internal:$OLLAMA_PORT" \
+    -e ENABLE_RAG_HYBRID_SEARCH=true \
+    -e RAG_RERANKING_MODEL="$RERANKING_MODEL" \
+    -e RAG_TOP_K="$RAG_TOP_K" \
+    -e RAG_TOP_K_RERANKER="$RAG_TOP_K_RERANKER" \
+    -e CHUNK_SIZE="$RAG_CHUNK_SIZE" \
+    -e CHUNK_OVERLAP="$RAG_CHUNK_OVERLAP" \
     -v "$WEBUI_VOLUME:/app/backend/data" \
     "$WEBUI_IMAGE" >/dev/null
 
   success "Container '$WEBUI_CONTAINER' running on :$WEBUI_PORT"
+}
+
+# Enforce RAG config in sqlite. Open WebUI has "PersistentConfig" — env vars
+# only apply on first container creation with a fresh volume. For upgrades
+# (volume already has a config row), env vars are ignored. This function
+# patches the sqlite config so settings are always current after install.
+configure_webui_rag() {
+  step "Applying RAG configuration to Open WebUI"
+
+  # Wait for sqlite config row to exist (fresh installs init it on first boot)
+  local i
+  for i in {1..30}; do
+    if podman exec "$WEBUI_CONTAINER" test -s /app/backend/data/webui.db 2>/dev/null \
+      && podman exec "$WEBUI_CONTAINER" python3 -c "
+import sqlite3
+c = sqlite3.connect('/app/backend/data/webui.db')
+r = c.execute(\"SELECT count(*) FROM config\").fetchone()
+c.close()
+exit(0 if r[0] > 0 else 1)
+" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  # Patch the config row
+  local py_script; py_script=$(mktemp)
+  cat > "$py_script" <<PYEOF
+import sqlite3, json, sys
+DB = "/app/backend/data/webui.db"
+c = sqlite3.connect(DB)
+row = c.execute("SELECT id, data FROM config ORDER BY id DESC LIMIT 1").fetchone()
+if not row:
+    print("no config row yet — skipping (will apply on next install run)")
+    sys.exit(0)
+cfg_id, raw = row
+cfg = json.loads(raw)
+rag = cfg.setdefault("rag", {})
+rag.update({
+    "embedding_engine": "ollama",
+    "embedding_model": "$EMBEDDING_MODEL",
+    "enable_hybrid_search": True,
+    "reranking_model": "$RERANKING_MODEL",
+    "top_k": $RAG_TOP_K,
+    "top_k_reranker": $RAG_TOP_K_RERANKER,
+    "chunk_size": $RAG_CHUNK_SIZE,
+    "chunk_overlap": $RAG_CHUNK_OVERLAP,
+})
+# Ensure Ollama endpoint is set for embeddings
+rag.setdefault("ollama", {})["url"] = "http://host.containers.internal:$OLLAMA_PORT"
+c.execute("UPDATE config SET data = ? WHERE id = ?", (json.dumps(cfg), cfg_id))
+c.commit()
+c.close()
+print("ok")
+PYEOF
+  podman cp "$py_script" "$WEBUI_CONTAINER:/tmp/patch_rag.py" >/dev/null
+  rm -f "$py_script"
+
+  if podman exec "$WEBUI_CONTAINER" python3 /tmp/patch_rag.py >/dev/null 2>&1; then
+    # Restart so in-memory config is refreshed from sqlite
+    podman restart "$WEBUI_CONTAINER" >/dev/null
+    success "RAG config applied: $EMBEDDING_MODEL + reranker, top_k=$RAG_TOP_K/$RAG_TOP_K_RERANKER, chunks=${RAG_CHUNK_SIZE}/${RAG_CHUNK_OVERLAP}"
+  else
+    warn "Could not patch RAG config — env vars from container creation still apply for fresh installs"
+  fi
 }
 
 install_launch_agents() {
@@ -380,6 +541,11 @@ EOF
 </plist>
 EOF
 
+  # Stop any foreground `ollama serve` started by ensure_ollama_running
+  # so launchd can bind the port without a conflict.
+  pkill -f "ollama serve" 2>/dev/null || true
+  sleep 1
+
   for plist in "$OLLAMA_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
     launchctl unload "$plist" 2>/dev/null || true
     launchctl load   "$plist"
@@ -409,9 +575,15 @@ install_shell_aliases() {
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
   fi
 
+  # Remove any previous Local AI block (so URL/port changes apply on re-install)
   if grep -q "# --- Local AI Setup ---" "$rc"; then
-    info "Aliases already present in $rc — skipping"
-    return
+    local tmp; tmp=$(mktemp)
+    awk '
+      /^# --- Local AI Setup ---$/ { skip=1; next }
+      skip && /^# --- End Local AI Setup ---$/ { skip=0; next }
+      !skip
+    ' "$rc" > "$tmp" && mv "$tmp" "$rc"
+    info "Removed old aliases from $rc"
   fi
 
   cat >> "$rc" <<EOF
@@ -423,9 +595,10 @@ alias ai-stop='local-ai stop'
 alias ai-status='local-ai status'
 alias ai-logs='podman logs -f $WEBUI_CONTAINER'
 alias ai-update='local-ai update'
+# --- End Local AI Setup ---
 EOF
 
-  success "Aliases added to $rc (open new shell to use)"
+  success "Aliases written to $rc (open new shell to use)"
 }
 
 install_config() {
@@ -479,6 +652,25 @@ OLLAMA_KV_CACHE_TYPE="f16"
 # Podman VM resources (adjust for your hardware)
 PODMAN_CPUS="6"
 PODMAN_MEMORY="4096"
+
+# --- RAG / Document search (Knowledge Bases in Open WebUI) ---
+# Embedding model for document chunks. bge-m3 is multilingual (100+ langs,
+# strong German); nomic-embed-text is lighter (274MB) but English-first.
+EMBEDDING_MODEL="bge-m3"
+
+# Reranker — re-scores the top vector hits for much better retrieval precision.
+# ~500MB, downloaded from HuggingFace on first RAG query, then cached locally.
+RERANKING_MODEL="BAAI/bge-reranker-v2-m3"
+
+# Retrieval tuning: vector search pulls TOP_K candidates, reranker picks the
+# best TOP_K_RERANKER from those. Raising TOP_K improves recall, costs latency.
+RAG_TOP_K="20"
+RAG_TOP_K_RERANKER="5"
+
+# Chunk size / overlap for document splitting. 1500/200 works well for typical
+# PDFs and docs. Smaller chunks = more precise retrieval, more re-ranker work.
+RAG_CHUNK_SIZE="1500"
+RAG_CHUNK_OVERLAP="200"
 CONF
 
   success "Config created: $CONFIG_FILE"
@@ -490,17 +682,29 @@ cmd_install() {
   check_prerequisites
   mkdir -p "$LOG_DIR"
   install_config
+
+  # SAFETY: refuse if another model server (LM Studio) already holds RAM
+  check_no_competing_servers
+
+  # download_model / pre-load need a reachable Ollama API — start it now.
+  # install_launch_agents will later take over (it kills this process first).
+  ensure_ollama_running
+
   download_model
+  download_embedding_model
   setup_hostname
   setup_podman_machine
   setup_container
+  configure_webui_rag
   install_launch_agents
   install_script
   install_shell_aliases
 
-  # SAFETY: verify enough RAM before pre-loading the model
-  check_no_competing_servers
+  # RAM check before pre-loading the 16GB model
   preflight_memory_check
+
+  # launchd started Ollama asynchronously — wait until API is reachable again
+  ensure_ollama_running
 
   # Pre-load model so first chat is instant
   step "Pre-loading model"
