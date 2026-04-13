@@ -43,6 +43,9 @@ readonly MODEL_ID="${MODEL_ID:-gemma4-26b}"
 readonly MODEL_GGUF_PATH="${MODEL_GGUF_PATH:-}"
 # Estimated model size in GB — used by safety check before loading
 readonly MODEL_SIZE_GB="${MODEL_SIZE_GB:-16}"
+# Context length (tokens). Ollama default is 4096 — too small for documents.
+# 32768 is a safe default on 32GB systems with q8_0 KV cache + flash attention.
+readonly MODEL_CONTEXT_LENGTH="${MODEL_CONTEXT_LENGTH:-32768}"
 
 # Ollama runtime tuning (conservative defaults — opt-in for aggressive)
 readonly OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-0}"
@@ -171,10 +174,13 @@ download_model() {
     info "(no re-download — uses your local file)"
 
     local modelfile; modelfile=$(mktemp)
-    echo "FROM $MODEL_GGUF_PATH" > "$modelfile"
+    cat > "$modelfile" <<EOF
+FROM $MODEL_GGUF_PATH
+PARAMETER num_ctx $MODEL_CONTEXT_LENGTH
+EOF
 
     if ollama create "$MODEL_ID" -f "$modelfile"; then
-      success "Model '$MODEL_ID' imported"
+      success "Model '$MODEL_ID' imported (context: $MODEL_CONTEXT_LENGTH tokens)"
     else
       rm -f "$modelfile"
       die "Import failed — check Ollama version supports this model architecture"
@@ -183,7 +189,15 @@ download_model() {
   else
     info "Pulling $MODEL_ID from Ollama registry — this may take 10-20 minutes..."
     if ollama pull "$MODEL_ID"; then
-      success "Model '$MODEL_ID' downloaded"
+      # Re-create with custom context length (registry default is usually 4096)
+      local modelfile; modelfile=$(mktemp)
+      cat > "$modelfile" <<EOF
+FROM $MODEL_ID
+PARAMETER num_ctx $MODEL_CONTEXT_LENGTH
+EOF
+      ollama create "${MODEL_ID}" -f "$modelfile" >/dev/null
+      rm -f "$modelfile"
+      success "Model '$MODEL_ID' downloaded (context: $MODEL_CONTEXT_LENGTH tokens)"
     else
       die "Pull failed — verify model name at https://ollama.com/library or set MODEL_GGUF_PATH"
     fi
@@ -389,6 +403,13 @@ MODEL_ID="gemma4-26b"
 # Estimated model size in GB — used by safety check before loading.
 # Set this slightly higher than the actual quantized model size on disk.
 MODEL_SIZE_GB="16"
+
+# Context length in tokens. Larger = more document/conversation history,
+# but uses more KV-cache RAM. Safe ranges on 32GB:
+#   8192   — minimal
+#   32768  — recommended balance
+#   65536  — only with q8_0 KV cache + flash attention
+MODEL_CONTEXT_LENGTH="32768"
 
 # Optional: import an existing GGUF file instead of pulling from Ollama registry.
 # Useful if you already have models from LM Studio or HuggingFace.
