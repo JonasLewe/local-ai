@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # local-ai.sh — Hassle-free local AI stack for macOS (Apple Silicon)
-# Stack: LM Studio (headless) + Open WebUI (Podman) + launchd auto-start
+# Stack: Ollama (native) + Open WebUI (Podman) + launchd auto-start
 #
 # Usage:
 #   ./local-ai.sh install     # First-time setup (incl. model download)
+#   ./local-ai.sh start       # Start all services (with safety check)
+#   ./local-ai.sh stop        # Stop all services, free RAM
 #   ./local-ai.sh update      # Pull latest stable Open WebUI image
 #   ./local-ai.sh status      # Health check all components
 #   ./local-ai.sh doctor      # Diagnose common problems
 #   ./local-ai.sh logs        # Tail all relevant logs
 #   ./local-ai.sh backup      # Backup chats & settings
 #   ./local-ai.sh restore     # Restore from backup
-#   ./local-ai.sh uninstall   # Remove everything (keeps LM Studio + models)
+#   ./local-ai.sh uninstall   # Remove everything (keeps Ollama + models)
 #
-# Requirements: macOS 13+, Apple Silicon, LM Studio installed, Homebrew
+# Requirements: macOS 13+, Apple Silicon, Ollama installed, Homebrew
 
 set -euo pipefail
 
@@ -377,16 +379,21 @@ install_config() {
 
   cat > "$CONFIG_FILE" <<'CONF'
 # Local AI Configuration
-# Edit these values, then re-run: ./local-ai.sh install
+# Edit these values, then re-run: local-ai install
 # Changes take effect on next install/restart.
 
-# Model to download and use (any LM Studio-compatible model ID)
-# Examples:
-#   MODEL_ID="google/gemma-4-26b-a4b"
-#   MODEL_ID="meta-llama/llama-3.1-8b-instruct"
-#   MODEL_ID="mistralai/mistral-7b-instruct-v0.3"
-#   MODEL_ID="qwen/qwen2.5-14b-instruct"
-MODEL_ID="google/gemma-4-26b-a4b"
+# Model to use (Ollama naming, e.g. "gemma4-26b" or "llama3.1:8b")
+# Browse models at https://ollama.com/library
+MODEL_ID="gemma4-26b"
+
+# Estimated model size in GB — used by safety check before loading.
+# Set this slightly higher than the actual quantized model size on disk.
+MODEL_SIZE_GB="16"
+
+# Optional: import an existing GGUF file instead of pulling from Ollama registry.
+# Useful if you already have models from LM Studio or HuggingFace.
+# Leave empty to pull from the registry.
+MODEL_GGUF_PATH=""
 
 # Web UI access
 # Set WEBUI_HOSTNAME to a custom name (e.g. "ai.local") for a friendly URL.
@@ -394,7 +401,13 @@ MODEL_ID="google/gemma-4-26b-a4b"
 # Set WEBUI_PORT to 80 for a clean URL without port number.
 WEBUI_HOSTNAME="localhost"
 WEBUI_PORT="3000"
-LMS_PORT="1234"
+OLLAMA_PORT="11434"
+
+# Ollama runtime tuning (defaults are safe — opt-in to aggressive settings)
+# OLLAMA_FLASH_ATTENTION=1 enables faster attention but uses more RAM.
+# OLLAMA_KV_CACHE_TYPE=q8_0 halves KV-cache memory at small quality cost.
+OLLAMA_FLASH_ATTENTION="0"
+OLLAMA_KV_CACHE_TYPE="f16"
 
 # Podman VM resources (adjust for your hardware)
 PODMAN_CPUS="6"
@@ -531,14 +544,22 @@ cmd_update() {
 cmd_status() {
   printf "${C_BOLD}Local AI Status${C_RESET}\n\n"
 
-  # LM Studio
-  printf "${C_BOLD}LM Studio Server${C_RESET} (:$LMS_PORT)\n"
-  if curl -s --max-time 2 "http://localhost:$LMS_PORT/v1/models" >/dev/null 2>&1; then
-    local models; models=$(curl -s "http://localhost:$LMS_PORT/v1/models" | jq -r '.data[].id' 2>/dev/null | sed 's/^/    /')
+  # Memory
+  local available; available=$(get_available_ram_gb)
+  printf "${C_BOLD}Memory${C_RESET}\n"
+  info "${available}GB available (need ${MODEL_SIZE_GB}GB + 4GB buffer to load model)"
+
+  # Ollama
+  echo
+  printf "${C_BOLD}Ollama Server${C_RESET} (:$OLLAMA_PORT)\n"
+  if curl -s --max-time 2 "http://localhost:$OLLAMA_PORT/api/tags" >/dev/null 2>&1; then
+    local models; models=$(curl -s "http://localhost:$OLLAMA_PORT/api/tags" | jq -r '.models[].name' 2>/dev/null | sed 's/^/    /')
     success "Online"
     [[ -n "$models" ]] && echo "  Available models:" && echo "$models"
+    local loaded; loaded=$(curl -s "http://localhost:$OLLAMA_PORT/api/ps" | jq -r '.models[].name' 2>/dev/null | sed 's/^/    /')
+    [[ -n "$loaded" ]] && echo "  Loaded in RAM:" && echo "$loaded"
   else
-    error "Offline — check: tail $LOG_LMS_ERR"
+    error "Offline — check: tail $LOG_OLLAMA_ERR"
   fi
 
   # Podman machine
@@ -568,7 +589,7 @@ cmd_status() {
   # Launch agents
   echo
   printf "${C_BOLD}Launch Agents${C_RESET}\n"
-  for agent in ai.lmstudio.server io.podman.machine ai.openwebui; do
+  for agent in ai.ollama.server io.podman.machine ai.openwebui; do
     if launchctl list | grep -q "$agent"; then
       success "$agent loaded"
     else
@@ -580,8 +601,11 @@ cmd_status() {
 cmd_doctor() {
   printf "${C_BOLD}Running diagnostics${C_RESET}\n\n"
 
+  info "Available memory: $(get_available_ram_gb)GB (need $((MODEL_SIZE_GB + 4))GB to load model)"
+
+  echo
   info "Checking port conflicts..."
-  for port in "$LMS_PORT" "$WEBUI_PORT"; do
+  for port in "$OLLAMA_PORT" "$WEBUI_PORT"; do
     local pid; pid=$(lsof -ti ":$port" 2>/dev/null | head -1)
     if [[ -n "$pid" ]]; then
       local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null)
@@ -592,8 +616,8 @@ cmd_doctor() {
   done
 
   echo
-  info "Recent LM Studio errors (last 10 lines):"
-  [[ -f "$LOG_LMS_ERR" ]] && tail -10 "$LOG_LMS_ERR" | sed 's/^/  /' || echo "  (no log yet)"
+  info "Recent Ollama errors (last 10 lines):"
+  [[ -f "$LOG_OLLAMA_ERR" ]] && tail -10 "$LOG_OLLAMA_ERR" | sed 's/^/  /' || echo "  (no log yet)"
 
   echo
   info "Recent container logs (last 20 lines):"
@@ -610,7 +634,7 @@ cmd_doctor() {
 
 cmd_logs() {
   info "Tailing all logs (Ctrl-C to exit)..."
-  tail -f "$LOG_LMS" "$LOG_LMS_ERR" "$LOG_WEBUI" "$LOG_PODMAN" 2>/dev/null
+  tail -f "$LOG_OLLAMA" "$LOG_OLLAMA_ERR" "$LOG_WEBUI" "$LOG_PODMAN" 2>/dev/null
 }
 
 cmd_uninstall() {
@@ -698,13 +722,15 @@ Usage:
   $0 restore <file>       Restore from backup archive
   $0 uninstall [--purge]  Remove everything (--purge also deletes WebUI data)
 
-Environment variables:
+Environment variables (all overridable via config file):
+  MODEL_ID=$MODEL_ID                Ollama model to use
+  MODEL_SIZE_GB=$MODEL_SIZE_GB                       Estimated size for safety check
+  MODEL_GGUF_PATH=...               Optional: import GGUF instead of pulling
   WEBUI_HOSTNAME=$WEBUI_HOSTNAME       Custom hostname (e.g. ai.local)
-  WEBUI_PORT=$WEBUI_PORT            Open WebUI port (80 for clean URL)
-  LMS_PORT=$LMS_PORT              LM Studio server port
-  MODEL_ID=$MODEL_ID    Model to download
-  PODMAN_CPUS=$PODMAN_CPUS             Podman machine CPU count
-  PODMAN_MEMORY=$PODMAN_MEMORY       Podman machine memory (MB)
+  WEBUI_PORT=$WEBUI_PORT                  Open WebUI port (80 for clean URL)
+  OLLAMA_PORT=$OLLAMA_PORT             Ollama API port
+  PODMAN_CPUS=$PODMAN_CPUS                   Podman machine CPU count
+  PODMAN_MEMORY=$PODMAN_MEMORY             Podman machine memory (MB)
 
 Config file: $CONFIG_FILE
 EOF
