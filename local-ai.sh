@@ -238,10 +238,9 @@ setup_container() {
     --name "$WEBUI_CONTAINER" \
     --restart=always \
     -p "$WEBUI_PORT:8080" \
-    -e OPENAI_API_BASE_URL="http://host.containers.internal:$LMS_PORT/v1" \
-    -e OPENAI_API_KEY=lm-studio \
+    -e OLLAMA_BASE_URL="http://host.containers.internal:$OLLAMA_PORT" \
     -e WEBUI_AUTH=true \
-    -e ENABLE_OLLAMA_API=false \
+    -e ENABLE_OPENAI_API=false \
     -v "$WEBUI_VOLUME:/app/backend/data" \
     "$WEBUI_IMAGE" >/dev/null
 
