@@ -108,16 +108,53 @@ get_available_ram_gb() {
   echo $(( (free_pages + inactive_pages) * page_size / 1024 / 1024 / 1024 ))
 }
 
-# Refuse to proceed if not enough RAM for needed_gb + 4GB buffer
+# Detect actual model size in GB. Tries (in order):
+#   1. ollama list  (works after import/pull)
+#   2. GGUF file size on disk  (if MODEL_GGUF_PATH set)
+#   3. MODEL_SIZE_GB config value as last-resort fallback
+get_model_size_gb() {
+  # 1. Ask Ollama directly
+  local size_field; size_field=$(ollama list 2>/dev/null | awk -v m="$MODEL_ID" '
+    NR==1 { next }                       # skip header
+    {
+      name = $1
+      sub(/:.*/, "", name)               # strip :tag
+      if (name == m || $1 == m || $1 == m":latest") {
+        print $3, $4                     # size + unit (e.g. "16 GB")
+        exit
+      }
+    }')
+  if [[ -n "$size_field" ]]; then
+    local n; n=$(awk '{print int($1+0.5)}' <<< "$size_field")  # round
+    local u; u=$(awk '{print toupper($2)}' <<< "$size_field")
+    case "$u" in
+      GB) echo "$n"; return ;;
+      MB) echo 1; return ;;
+      TB) echo $((n * 1024)); return ;;
+    esac
+  fi
+
+  # 2. Stat the GGUF file
+  if [[ -n "$MODEL_GGUF_PATH" && -f "$MODEL_GGUF_PATH" ]]; then
+    local bytes; bytes=$(stat -f%z "$MODEL_GGUF_PATH" 2>/dev/null)
+    [[ -n "$bytes" ]] && echo $((bytes / 1024 / 1024 / 1024 + 1)) && return
+  fi
+
+  # 3. Fallback to config
+  echo "${MODEL_SIZE_GB:-16}"
+}
+
+# Refuse to proceed if not enough RAM for model + 4GB buffer
 preflight_memory_check() {
-  local needed_gb="$1"
+  local needed_gb; needed_gb=$(get_model_size_gb)
   local buffer_gb=4
   local required=$((needed_gb + buffer_gb))
   local available; available=$(get_available_ram_gb)
 
   step "Memory preflight check"
-  info "Required: ${required}GB (model ${needed_gb}GB + ${buffer_gb}GB buffer)"
-  info "Available: ${available}GB"
+  info "Model size:  ${needed_gb}GB (auto-detected)"
+  info "Required:    ${required}GB (model + ${buffer_gb}GB buffer)"
+  info "Available:   ${available}GB"
 
   if [[ "$available" -lt "$required" ]]; then
     error "INSUFFICIENT MEMORY — refusing to proceed"
@@ -400,8 +437,8 @@ install_config() {
 # Browse models at https://ollama.com/library
 MODEL_ID="gemma4-26b"
 
-# Estimated model size in GB — used by safety check before loading.
-# Set this slightly higher than the actual quantized model size on disk.
+# Optional: fallback model size in GB if auto-detection fails.
+# Normally not needed — script reads actual size from `ollama list` or GGUF file.
 MODEL_SIZE_GB="16"
 
 # Context length in tokens. Larger = more document/conversation history,
@@ -454,7 +491,7 @@ cmd_install() {
 
   # SAFETY: verify enough RAM before pre-loading the model
   check_no_competing_servers
-  preflight_memory_check "$MODEL_SIZE_GB"
+  preflight_memory_check
 
   # Pre-load model so first chat is instant
   step "Pre-loading model"
@@ -509,7 +546,7 @@ cmd_start() {
 
   # SAFETY: refuse to start if other model servers would compete for RAM
   check_no_competing_servers
-  preflight_memory_check "$MODEL_SIZE_GB"
+  preflight_memory_check
 
   # Reload launch agents
   for plist in "$OLLAMA_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
@@ -568,7 +605,8 @@ cmd_status() {
   # Memory
   local available; available=$(get_available_ram_gb)
   printf "${C_BOLD}Memory${C_RESET}\n"
-  info "${available}GB available (need ${MODEL_SIZE_GB}GB + 4GB buffer to load model)"
+  local needed; needed=$(get_model_size_gb)
+  info "${available}GB available (need ${needed}GB + 4GB buffer to load model)"
 
   # Ollama
   echo
@@ -622,7 +660,8 @@ cmd_status() {
 cmd_doctor() {
   printf "${C_BOLD}Running diagnostics${C_RESET}\n\n"
 
-  info "Available memory: $(get_available_ram_gb)GB (need $((MODEL_SIZE_GB + 4))GB to load model)"
+  local needed; needed=$(get_model_size_gb)
+  info "Available memory: $(get_available_ram_gb)GB (need $((needed + 4))GB to load model)"
 
   echo
   info "Checking port conflicts..."
