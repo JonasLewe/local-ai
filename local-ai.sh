@@ -147,60 +147,44 @@ check_prerequisites() {
   require_cmd podman "brew install podman"
   require_cmd jq    "brew install jq"
   require_cmd curl  "built-in on macOS"
-
-  [[ -d "/Applications/LM Studio.app" ]] || \
-    die "LM Studio not found in /Applications. Download from https://lmstudio.ai"
-
-  if [[ ! -f "$HOME/.lmstudio/bin/lms" ]]; then
-    die "LM Studio CLI not found at ~/.lmstudio/bin/lms — open LM Studio.app once to initialize, then re-run."
-  elif [[ ! -x "$HOME/.lmstudio/bin/lms" ]]; then
-    warn "LM Studio CLI not executable — fixing permissions"
-    chmod +x "$HOME/.lmstudio/bin/lms"
-  fi
+  require_cmd ollama "brew install ollama"
 
   success "All prerequisites present"
 }
 
 # ---------- Install steps ----------
-configure_lms() {
-  step "Configuring LM Studio headless mode"
-  local lms="$HOME/.lmstudio/bin/lms"
-
-  # Start server to verify it works, then stop (launchd will manage it)
-  "$lms" server start --port "$LMS_PORT" >/dev/null 2>&1 || true
-  sleep 2
-
-  if curl -s --max-time 3 "http://localhost:$LMS_PORT/v1/models" >/dev/null 2>&1; then
-    success "LM Studio server verified on :$LMS_PORT"
-  else
-    warn "LM Studio server did not respond — it may need a moment"
-  fi
-
-  "$lms" server stop >/dev/null 2>&1 || true
-}
-
 download_model() {
   step "Checking model: $MODEL_ID"
-  local lms="$HOME/.lmstudio/bin/lms"
 
-  # Derive search pattern from MODEL_ID (e.g. "google/gemma-4-26b-a4b" → "gemma-4-26b")
-  local model_name; model_name="${MODEL_ID##*/}"  # strip publisher prefix
-
-  if "$lms" ls 2>/dev/null | grep -qi "$model_name"; then
-    success "Model '$model_name' already downloaded"
+  # Already in Ollama's library?
+  if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$MODEL_ID\(:latest\)\?"; then
+    success "Model '$MODEL_ID' already available in Ollama"
     return
   fi
 
-  info "Downloading $MODEL_ID — this may take 10-20 minutes..."
-  if "$lms" get "$MODEL_ID" -y 2>/dev/null; then
-    success "Model downloaded successfully"
+  # Disk-only check (no RAM impact) before any download/import
+  if [[ -n "$MODEL_GGUF_PATH" ]]; then
+    [[ -f "$MODEL_GGUF_PATH" ]] || die "MODEL_GGUF_PATH set but file not found: $MODEL_GGUF_PATH"
+    info "Importing existing GGUF: $MODEL_GGUF_PATH"
+    info "(no re-download — uses your local file)"
+
+    local modelfile; modelfile=$(mktemp)
+    echo "FROM $MODEL_GGUF_PATH" > "$modelfile"
+
+    if ollama create "$MODEL_ID" -f "$modelfile"; then
+      success "Model '$MODEL_ID' imported"
+    else
+      rm -f "$modelfile"
+      die "Import failed — check Ollama version supports this model architecture"
+    fi
+    rm -f "$modelfile"
   else
-    warn "Auto-download failed — please download manually:"
-    warn "  1. Open LM Studio"
-    warn "  2. Go to the Discover tab"
-    warn "  3. Search for '$MODEL_ID'"
-    warn "  4. Select the Q4_K_M quantization"
-    warn "  5. Click Download"
+    info "Pulling $MODEL_ID from Ollama registry — this may take 10-20 minutes..."
+    if ollama pull "$MODEL_ID"; then
+      success "Model '$MODEL_ID' downloaded"
+    else
+      die "Pull failed — verify model name at https://ollama.com/library or set MODEL_GGUF_PATH"
+    fi
   fi
 }
 
@@ -420,7 +404,6 @@ cmd_install() {
   check_prerequisites
   mkdir -p "$LOG_DIR"
   install_config
-  configure_lms
   download_model
   setup_hostname
   setup_podman_machine
