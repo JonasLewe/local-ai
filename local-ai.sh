@@ -3,36 +3,70 @@
 # Stack: LM Studio (headless) + Open WebUI (Podman) + launchd auto-start
 #
 # Usage:
-#   ./local-ai.sh install     # First-time setup
-#   ./local-ai.sh update      # Pull latest Open WebUI dev image
+#   ./local-ai.sh install     # First-time setup (incl. model download)
+#   ./local-ai.sh update      # Pull latest stable Open WebUI image
 #   ./local-ai.sh status      # Health check all components
 #   ./local-ai.sh doctor      # Diagnose common problems
-#   ./local-ai.sh uninstall   # Remove everything (keeps LM Studio + models)
 #   ./local-ai.sh logs        # Tail all relevant logs
+#   ./local-ai.sh backup      # Backup chats & settings
+#   ./local-ai.sh restore     # Restore from backup
+#   ./local-ai.sh uninstall   # Remove everything (keeps LM Studio + models)
 #
 # Requirements: macOS 13+, Apple Silicon, LM Studio installed, Homebrew
 
 set -euo pipefail
 
 # ---------- Configuration ----------
-readonly SCRIPT_VERSION="1.0.0"
-readonly LMS_PORT="${LMS_PORT:-1234}"
+readonly SCRIPT_VERSION="2.0.0"
+readonly CONFIG_DIR="${HOME}/.config/local-ai"
+readonly CONFIG_FILE="$CONFIG_DIR/config"
+
+# Source user config file if it exists (overrides defaults via env vars)
+# shellcheck disable=SC1090
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# Ports
+readonly OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 readonly WEBUI_PORT="${WEBUI_PORT:-3000}"
-readonly WEBUI_IMAGE="ghcr.io/open-webui/open-webui:dev"
+readonly WEBUI_HOSTNAME="${WEBUI_HOSTNAME:-localhost}"
+
+# Container
+readonly WEBUI_IMAGE="ghcr.io/open-webui/open-webui:latest"
 readonly WEBUI_CONTAINER="open-webui"
 readonly WEBUI_VOLUME="open-webui"
-readonly PODMAN_CPUS="${PODMAN_CPUS:-4}"
+
+# Model (Ollama naming, e.g. "gemma4-26b" or "llama3.1:8b")
+readonly MODEL_ID="${MODEL_ID:-gemma4-26b}"
+# Optional: path to existing GGUF file to import instead of pulling from registry
+readonly MODEL_GGUF_PATH="${MODEL_GGUF_PATH:-}"
+# Estimated model size in GB — used by safety check before loading
+readonly MODEL_SIZE_GB="${MODEL_SIZE_GB:-16}"
+
+# Ollama runtime tuning (conservative defaults — opt-in for aggressive)
+readonly OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-0}"
+readonly OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-f16}"
+
+# Podman VM
+readonly PODMAN_CPUS="${PODMAN_CPUS:-6}"
 readonly PODMAN_MEMORY="${PODMAN_MEMORY:-4096}"
 
 readonly LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-readonly LMS_PLIST="$LAUNCH_AGENTS_DIR/ai.lmstudio.server.plist"
+readonly OLLAMA_PLIST="$LAUNCH_AGENTS_DIR/ai.ollama.server.plist"
 readonly PODMAN_PLIST="$LAUNCH_AGENTS_DIR/io.podman.machine.plist"
 readonly WEBUI_PLIST="$LAUNCH_AGENTS_DIR/ai.openwebui.plist"
 
-readonly LOG_LMS="/tmp/lms.out.log"
-readonly LOG_LMS_ERR="/tmp/lms.err.log"
-readonly LOG_PODMAN="/tmp/podman-machine.log"
-readonly LOG_WEBUI="/tmp/openwebui.log"
+readonly LOG_DIR="${HOME}/.local/share/local-ai/logs"
+readonly LOG_OLLAMA="$LOG_DIR/ollama.log"
+readonly LOG_OLLAMA_ERR="$LOG_DIR/ollama.err.log"
+readonly LOG_PODMAN="$LOG_DIR/podman-machine.log"
+readonly LOG_WEBUI="$LOG_DIR/openwebui.log"
+
+# Build the user-facing URL
+if [[ "$WEBUI_PORT" == "80" ]]; then
+  readonly WEBUI_URL="http://$WEBUI_HOSTNAME"
+else
+  readonly WEBUI_URL="http://$WEBUI_HOSTNAME:$WEBUI_PORT"
+fi
 
 # ---------- Output helpers ----------
 readonly C_RED=$'\033[0;31m'
@@ -59,6 +93,54 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing: $1. Install with: $2"
 }
 
+# ---------- Safety checks ----------
+# Returns available RAM in GB (free + inactive pages)
+get_available_ram_gb() {
+  local page_size; page_size=$(vm_stat | head -1 | awk '{print $8}')
+  [[ -z "$page_size" ]] && page_size=16384
+  local free_pages;     free_pages=$(vm_stat     | awk '/Pages free/      {gsub(/\./, "", $3); print $3}')
+  local inactive_pages; inactive_pages=$(vm_stat | awk '/Pages inactive/  {gsub(/\./, "", $3); print $3}')
+  echo $(( (free_pages + inactive_pages) * page_size / 1024 / 1024 / 1024 ))
+}
+
+# Refuse to proceed if not enough RAM for needed_gb + 4GB buffer
+preflight_memory_check() {
+  local needed_gb="$1"
+  local buffer_gb=4
+  local required=$((needed_gb + buffer_gb))
+  local available; available=$(get_available_ram_gb)
+
+  step "Memory preflight check"
+  info "Required: ${required}GB (model ${needed_gb}GB + ${buffer_gb}GB buffer)"
+  info "Available: ${available}GB"
+
+  if [[ "$available" -lt "$required" ]]; then
+    error "INSUFFICIENT MEMORY — refusing to proceed"
+    error "  Free up RAM by closing applications, or use a smaller model."
+    error "  Current state risks system freeze. ABORTING for your safety."
+    exit 1
+  fi
+  success "Memory check passed"
+}
+
+# Refuse to start Ollama if LM Studio still has models in RAM
+check_no_competing_servers() {
+  step "Checking for competing model servers"
+
+  # LM Studio: check if any model loaded
+  if [[ -x "$HOME/.lmstudio/bin/lms" ]]; then
+    if "$HOME/.lmstudio/bin/lms" ps 2>/dev/null | grep -qE "GB|MB"; then
+      error "LM Studio still has models loaded in RAM!"
+      error "  This would cause double memory consumption."
+      error "  Run: $HOME/.lmstudio/bin/lms unload --all"
+      error "  Then: $HOME/.lmstudio/bin/lms server stop"
+      exit 1
+    fi
+  fi
+
+  success "No competing model servers running"
+}
+
 check_prerequisites() {
   step "Checking prerequisites"
   require_macos
@@ -69,11 +151,12 @@ check_prerequisites() {
   [[ -d "/Applications/LM Studio.app" ]] || \
     die "LM Studio not found in /Applications. Download from https://lmstudio.ai"
 
-  [[ -x "$HOME/.lmstudio/bin/lms" ]] || {
-    warn "LM Studio CLI not bootstrapped — attempting bootstrap"
-    "$HOME/.lmstudio/bin/lms" bootstrap 2>/dev/null || \
-      die "Could not bootstrap 'lms'. Open LM Studio.app once manually, then re-run."
-  }
+  if [[ ! -f "$HOME/.lmstudio/bin/lms" ]]; then
+    die "LM Studio CLI not found at ~/.lmstudio/bin/lms — open LM Studio.app once to initialize, then re-run."
+  elif [[ ! -x "$HOME/.lmstudio/bin/lms" ]]; then
+    warn "LM Studio CLI not executable — fixing permissions"
+    chmod +x "$HOME/.lmstudio/bin/lms"
+  fi
 
   success "All prerequisites present"
 }
@@ -83,13 +166,60 @@ configure_lms() {
   step "Configuring LM Studio headless mode"
   local lms="$HOME/.lmstudio/bin/lms"
 
+  # Start server to verify it works, then stop (launchd will manage it)
   "$lms" server start --port "$LMS_PORT" >/dev/null 2>&1 || true
   sleep 2
-  "$lms" server set --jit-loading true    >/dev/null
-  "$lms" server set --jit-auto-evict true >/dev/null
-  "$lms" server stop >/dev/null 2>&1 || true
 
-  success "JIT loading enabled, auto-evict on"
+  if curl -s --max-time 3 "http://localhost:$LMS_PORT/v1/models" >/dev/null 2>&1; then
+    success "LM Studio server verified on :$LMS_PORT"
+  else
+    warn "LM Studio server did not respond — it may need a moment"
+  fi
+
+  "$lms" server stop >/dev/null 2>&1 || true
+}
+
+download_model() {
+  step "Checking model: $MODEL_ID"
+  local lms="$HOME/.lmstudio/bin/lms"
+
+  # Derive search pattern from MODEL_ID (e.g. "google/gemma-4-26b-a4b" → "gemma-4-26b")
+  local model_name; model_name="${MODEL_ID##*/}"  # strip publisher prefix
+
+  if "$lms" ls 2>/dev/null | grep -qi "$model_name"; then
+    success "Model '$model_name' already downloaded"
+    return
+  fi
+
+  info "Downloading $MODEL_ID — this may take 10-20 minutes..."
+  if "$lms" get "$MODEL_ID" -y 2>/dev/null; then
+    success "Model downloaded successfully"
+  else
+    warn "Auto-download failed — please download manually:"
+    warn "  1. Open LM Studio"
+    warn "  2. Go to the Discover tab"
+    warn "  3. Search for '$MODEL_ID'"
+    warn "  4. Select the Q4_K_M quantization"
+    warn "  5. Click Download"
+  fi
+}
+
+setup_hostname() {
+  [[ "$WEBUI_HOSTNAME" == "localhost" ]] && return
+
+  step "Setting up custom hostname: $WEBUI_HOSTNAME"
+
+  if grep -q "$WEBUI_HOSTNAME" /etc/hosts 2>/dev/null; then
+    success "$WEBUI_HOSTNAME already in /etc/hosts"
+  else
+    info "Adding $WEBUI_HOSTNAME to /etc/hosts (requires sudo)"
+    if echo "127.0.0.1 $WEBUI_HOSTNAME" | sudo tee -a /etc/hosts >/dev/null 2>&1; then
+      success "$WEBUI_HOSTNAME → 127.0.0.1 added to /etc/hosts"
+    else
+      warn "Could not write to /etc/hosts — run this once manually:"
+      warn "  echo '127.0.0.1 $WEBUI_HOSTNAME' | sudo tee -a /etc/hosts"
+    fi
+  fi
 }
 
 setup_podman_machine() {
@@ -123,9 +253,8 @@ setup_container() {
   podman run -d \
     --name "$WEBUI_CONTAINER" \
     --restart=always \
-    --add-host=host.docker.internal:host-gateway \
     -p "$WEBUI_PORT:8080" \
-    -e OPENAI_API_BASE_URL="http://host.docker.internal:$LMS_PORT/v1" \
+    -e OPENAI_API_BASE_URL="http://host.containers.internal:$LMS_PORT/v1" \
     -e OPENAI_API_KEY=lm-studio \
     -e WEBUI_AUTH=true \
     -e ENABLE_OLLAMA_API=false \
@@ -207,6 +336,15 @@ EOF
   success "Auto-start agents installed & loaded"
 }
 
+install_script() {
+  step "Installing script to ~/.local/bin"
+  local target="$HOME/.local/bin/local-ai"
+  mkdir -p "$HOME/.local/bin"
+  cp "$(realpath "$0")" "$target"
+  chmod +x "$target"
+  success "Installed to $target"
+}
+
 install_shell_aliases() {
   step "Installing shell aliases"
 
@@ -214,49 +352,181 @@ install_shell_aliases() {
   [[ -n "${FISH_VERSION:-}" ]] && rc="$HOME/.config/fish/config.fish"
   [[ ! -f "$rc" ]] && touch "$rc"
 
+  # Ensure ~/.local/bin is in PATH
+  if ! grep -q '.local/bin' "$rc"; then
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+  fi
+
   if grep -q "# --- Local AI Setup ---" "$rc"; then
     info "Aliases already present in $rc — skipping"
     return
   fi
 
-  cat >> "$rc" <<'EOF'
+  cat >> "$rc" <<EOF
 
 # --- Local AI Setup ---
-alias webui='open http://localhost:3000'
-alias webui-logs='podman logs -f open-webui'
-alias webui-restart='podman restart open-webui'
-alias webui-update='podman pull ghcr.io/open-webui/open-webui:dev && podman restart open-webui'
-alias llm-logs='tail -f /tmp/lms.out.log'
-alias llm-status='~/bin/local-ai status 2>/dev/null || echo "run local-ai.sh status"'
+alias ai='open $WEBUI_URL'
+alias ai-start='local-ai start'
+alias ai-stop='local-ai stop'
+alias ai-status='local-ai status'
+alias ai-logs='podman logs -f $WEBUI_CONTAINER'
+alias ai-update='local-ai update'
 EOF
 
   success "Aliases added to $rc (open new shell to use)"
+}
+
+install_config() {
+  step "Setting up configuration"
+  mkdir -p "$CONFIG_DIR"
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    info "Config exists at $CONFIG_FILE — preserving"
+    return
+  fi
+
+  cat > "$CONFIG_FILE" <<'CONF'
+# Local AI Configuration
+# Edit these values, then re-run: ./local-ai.sh install
+# Changes take effect on next install/restart.
+
+# Model to download and use (any LM Studio-compatible model ID)
+# Examples:
+#   MODEL_ID="google/gemma-4-26b-a4b"
+#   MODEL_ID="meta-llama/llama-3.1-8b-instruct"
+#   MODEL_ID="mistralai/mistral-7b-instruct-v0.3"
+#   MODEL_ID="qwen/qwen2.5-14b-instruct"
+MODEL_ID="google/gemma-4-26b-a4b"
+
+# Web UI access
+# Set WEBUI_HOSTNAME to a custom name (e.g. "ai.local") for a friendly URL.
+# The script will add it to /etc/hosts automatically (requires sudo once).
+# Set WEBUI_PORT to 80 for a clean URL without port number.
+WEBUI_HOSTNAME="localhost"
+WEBUI_PORT="3000"
+LMS_PORT="1234"
+
+# Podman VM resources (adjust for your hardware)
+PODMAN_CPUS="6"
+PODMAN_MEMORY="4096"
+CONF
+
+  success "Config created: $CONFIG_FILE"
 }
 
 # ---------- Commands ----------
 cmd_install() {
   printf "${C_BOLD}Local AI Setup v%s${C_RESET}\n" "$SCRIPT_VERSION"
   check_prerequisites
+  mkdir -p "$LOG_DIR"
+  install_config
   configure_lms
+  download_model
+  setup_hostname
   setup_podman_machine
   setup_container
   install_launch_agents
+  install_script
   install_shell_aliases
+
+  # Pre-load model so first chat is instant
+  step "Pre-loading model"
+  local lms="$HOME/.lmstudio/bin/lms"
+  info "Loading $MODEL_ID into RAM (~20s)..."
+  "$lms" load "$MODEL_ID" -y 2>/dev/null || warn "Could not pre-load — first chat will trigger load"
 
   step "Done!"
   echo
-  success "Open WebUI:  http://localhost:$WEBUI_PORT"
+  success "Open WebUI:  $WEBUI_URL"
   success "LM Studio:   http://localhost:$LMS_PORT/v1"
   echo
   info "First-time browser setup: create admin account, then select model in chat."
-  info "Verify setup:  ./local-ai.sh status"
+  echo
+  info "Quick reference (open new shell first):"
+  info "  ai           → Open chat in browser"
+  info "  ai-stop      → Stop stack, free all resources"
+  info "  ai-start     → Start stack again"
+  info "  ai-status    → Health check"
+}
+
+cmd_stop() {
+  step "Stopping Local AI stack"
+
+  # Unload launch agents so they don't auto-restart
+  for plist in "$WEBUI_PLIST" "$PODMAN_PLIST" "$LMS_PLIST"; do
+    launchctl unload "$plist" 2>/dev/null || true
+  done
+  info "Launch agents unloaded (no auto-restart)"
+
+  # Stop container
+  podman stop "$WEBUI_CONTAINER" 2>/dev/null || true
+  info "Container stopped"
+
+  # Stop Podman machine (frees VM memory)
+  podman machine stop 2>/dev/null || true
+  info "Podman machine stopped"
+
+  # Stop LM Studio
+  "$HOME/.lmstudio/bin/lms" server stop 2>/dev/null || true
+  info "LM Studio stopped"
+
+  success "Stack stopped — all resources freed"
+  info "Run '$0 start' to bring it back up"
+}
+
+cmd_start() {
+  step "Starting Local AI stack"
+  local lms="$HOME/.lmstudio/bin/lms"
+
+  # Reload launch agents
+  for plist in "$LMS_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
+    if [[ -f "$plist" ]]; then
+      launchctl load "$plist" 2>/dev/null || true
+    else
+      warn "Agent not found: $plist — run '$0 install' first"
+      return 1
+    fi
+  done
+
+  # Wait for LM Studio server to be reachable
+  info "Waiting for LM Studio server..."
+  for i in {1..15}; do
+    curl -s --max-time 2 "http://localhost:$LMS_PORT/v1/models" >/dev/null 2>&1 && break
+    sleep 2
+  done
+
+  if curl -s --max-time 2 "http://localhost:$LMS_PORT/v1/models" >/dev/null 2>&1; then
+    success "LM Studio online"
+  else
+    warn "LM Studio not responding yet — model pre-load skipped"
+  fi
+
+  # Pre-load model so first chat response is instant
+  info "Pre-loading model: $MODEL_ID..."
+  if "$lms" load "$MODEL_ID" -y 2>/dev/null; then
+    success "Model loaded and ready"
+  else
+    warn "Could not pre-load model — first chat will be slow (~20s)"
+  fi
+
+  # Start Podman + container
+  if podman machine inspect --format '{{.State}}' 2>/dev/null | grep -q running; then
+    success "Podman machine running"
+    podman start "$WEBUI_CONTAINER" 2>/dev/null || true
+    success "Open WebUI starting at $WEBUI_URL"
+  else
+    info "Podman machine starting (may take 15-30 seconds)..."
+    info "Open WebUI will start automatically once the machine is ready"
+  fi
+
+  success "Stack started — ready to use"
 }
 
 cmd_update() {
   step "Updating Open WebUI"
   podman pull "$WEBUI_IMAGE"
   podman restart "$WEBUI_CONTAINER"
-  success "Restarted with latest dev image"
+  success "Restarted with latest stable image"
 }
 
 cmd_status() {
@@ -287,8 +557,8 @@ cmd_status() {
   printf "${C_BOLD}Open WebUI Container${C_RESET} (:$WEBUI_PORT)\n"
   if podman ps --filter "name=$WEBUI_CONTAINER" --format '{{.Status}}' 2>/dev/null | grep -q Up; then
     success "Running — $(podman ps --filter name=$WEBUI_CONTAINER --format '{{.Status}}')"
-    if curl -s --max-time 2 -o /dev/null -w "%{http_code}" "http://localhost:$WEBUI_PORT" | grep -qE '2..|3..'; then
-      success "HTTP responding at http://localhost:$WEBUI_PORT"
+    if curl -s --max-time 2 -o /dev/null -w "%{http_code}" "$WEBUI_URL" | grep -qE '2..|3..'; then
+      success "HTTP responding at $WEBUI_URL"
     else
       warn "Container up but HTTP not responding yet"
     fi
@@ -371,34 +641,87 @@ cmd_uninstall() {
   success "Uninstall complete"
 }
 
+cmd_backup() {
+  step "Backing up Open WebUI data"
+  local backup_dir="${1:-$HOME/local-ai-backups}"
+  local timestamp; timestamp=$(date +%Y%m%d_%H%M%S)
+  local backup_file="$backup_dir/openwebui_backup_$timestamp.tar.gz"
+
+  mkdir -p "$backup_dir"
+
+  if ! podman ps --filter "name=$WEBUI_CONTAINER" --format '{{.Status}}' 2>/dev/null | grep -q Up; then
+    die "Container not running — cannot export volume"
+  fi
+
+  info "Exporting volume '$WEBUI_VOLUME'..."
+  podman volume export "$WEBUI_VOLUME" | gzip > "$backup_file"
+
+  success "Backup saved: $backup_file"
+  info "Size: $(du -h "$backup_file" | cut -f1)"
+}
+
+cmd_restore() {
+  local backup_file="${1:-}"
+  [[ -z "$backup_file" ]] && die "Usage: $0 restore <backup-file.tar.gz>"
+  [[ -f "$backup_file" ]] || die "File not found: $backup_file"
+
+  step "Restoring Open WebUI data"
+  warn "This will REPLACE all current chats, settings, and documents."
+  read -r -p "Continue? [y/N] " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { info "Aborted"; exit 0; }
+
+  info "Stopping container..."
+  podman stop "$WEBUI_CONTAINER" 2>/dev/null || true
+
+  info "Importing volume..."
+  gunzip -c "$backup_file" | podman volume import "$WEBUI_VOLUME" -
+
+  info "Restarting container..."
+  podman start "$WEBUI_CONTAINER"
+
+  success "Restore complete — container restarted"
+}
+
 # ---------- Dispatcher ----------
 usage() {
   cat <<EOF
 ${C_BOLD}local-ai.sh${C_RESET} — Hassle-free local AI stack (v$SCRIPT_VERSION)
 
 Usage:
-  $0 install              First-time setup
-  $0 update               Pull latest Open WebUI dev image
+  $0 install              First-time setup (incl. model download)
+  $0 start                Start all services
+  $0 stop                 Stop all services (frees RAM + CPU)
+  $0 update               Pull latest stable Open WebUI image
   $0 status               Health check
   $0 doctor               Diagnose problems
   $0 logs                 Tail all logs
+  $0 backup [dir]         Backup chats & settings (default: ~/local-ai-backups)
+  $0 restore <file>       Restore from backup archive
   $0 uninstall [--purge]  Remove everything (--purge also deletes WebUI data)
 
 Environment variables:
+  WEBUI_HOSTNAME=$WEBUI_HOSTNAME       Custom hostname (e.g. ai.local)
+  WEBUI_PORT=$WEBUI_PORT            Open WebUI port (80 for clean URL)
   LMS_PORT=$LMS_PORT              LM Studio server port
-  WEBUI_PORT=$WEBUI_PORT            Open WebUI port
+  MODEL_ID=$MODEL_ID    Model to download
   PODMAN_CPUS=$PODMAN_CPUS             Podman machine CPU count
   PODMAN_MEMORY=$PODMAN_MEMORY       Podman machine memory (MB)
+
+Config file: $CONFIG_FILE
 EOF
 }
 
 main() {
   case "${1:-}" in
     install)   cmd_install ;;
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
     update)    cmd_update ;;
     status)    cmd_status ;;
     doctor)    cmd_doctor ;;
     logs)      cmd_logs ;;
+    backup)    shift; cmd_backup "${1:-}" ;;
+    restore)   shift; cmd_restore "${1:-}" ;;
     uninstall) shift; cmd_uninstall "${1:-}" ;;
     -h|--help|help|"") usage ;;
     *) error "Unknown command: $1"; usage; exit 1 ;;

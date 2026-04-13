@@ -2,9 +2,9 @@
 
 Hassle-free, auditable local AI stack for macOS (Apple Silicon). Designed for regulated / air-gapped environments where cloud AI assistants are not an option.
 
-**Stack:** LM Studio (headless) + Open WebUI (Podman, dev branch) + launchd auto-start.
+**Stack:** LM Studio (headless) + Open WebUI (Podman, stable) + launchd auto-start.
 
-Target hardware: Apple Silicon with ≥32 GB RAM. Default model: Gemma 4 26B-A4B Q4_K_M.
+Target hardware: Apple Silicon with ≥32 GB RAM. Default model: Gemma 4 26B-A4B Q4_K_M (auto-downloaded on install).
 
 ## Quick Start
 
@@ -24,29 +24,54 @@ After install, open http://localhost:3000, create the admin account, and select 
 
 ## Commands
 
-| Command                   | What it does                                                                                 |
-| ------------------------- | -------------------------------------------------------------------------------------------- |
-| `./local-ai.sh install`   | First-time setup: configure LM Studio, start Podman, create container, install launch agents |
-| `./local-ai.sh update`    | Pull latest Open WebUI dev image, restart container                                          |
-| `./local-ai.sh status`    | Health check all components                                                                  |
-| `./local-ai.sh doctor`    | Diagnose common problems (ports, logs, connections)                                          |
-| `./local-ai.sh logs`      | Tail all logs simultaneously                                                                 |
-| `./local-ai.sh uninstall` | Remove launch agents and container. `--purge` also removes chat history volume               |
+| Command                    | What it does                                                                                          |
+| -------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `./local-ai.sh install`    | First-time setup: download model, configure LM Studio, start Podman, create container, launch agents  |
+| `./local-ai.sh start`      | Start all services (LM Studio, Podman, Open WebUI)                                                    |
+| `./local-ai.sh stop`       | Stop all services and free RAM + CPU                                                                  |
+| `./local-ai.sh update`     | Pull latest stable Open WebUI image, restart container                                                |
+| `./local-ai.sh status`     | Health check all components                                                                           |
+| `./local-ai.sh doctor`     | Diagnose common problems (ports, logs, connections)                                                   |
+| `./local-ai.sh logs`       | Tail all logs simultaneously                                                                          |
+| `./local-ai.sh backup`     | Backup chats, settings & documents to `~/local-ai-backups/` (or custom dir)                           |
+| `./local-ai.sh restore`    | Restore from a backup archive                                                                         |
+| `./local-ai.sh uninstall`  | Remove launch agents and container. `--purge` also removes chat history volume                        |
+
+After install, these shell aliases are available (open new terminal first):
+
+| Alias        | What it does                    |
+| ------------ | ------------------------------- |
+| `ai`         | Open chat UI in browser         |
+| `ai-start`   | Start the stack                 |
+| `ai-stop`    | Stop the stack, free resources  |
+| `ai-status`  | Quick health check              |
+| `ai-logs`    | Tail container logs             |
+| `ai-update`  | Pull latest image + restart     |
 
 ## Configuration
 
-Override defaults via env vars:
+All settings live in `~/.config/local-ai/config` (created automatically on first install). Edit the file and re-run `./local-ai.sh install` to apply changes.
 
 ```bash
-WEBUI_PORT=8080 PODMAN_MEMORY=8192 ./local-ai.sh install
+# Switch to a different model:
+vi ~/.config/local-ai/config
+# Change MODEL_ID="google/gemma-4-26b-a4b" to e.g. MODEL_ID="meta-llama/llama-3.1-8b-instruct"
+./local-ai.sh install
 ```
 
-| Variable        | Default | Purpose                         |
-| --------------- | ------- | ------------------------------- |
-| `LMS_PORT`      | 1234    | LM Studio OpenAI-compatible API |
-| `WEBUI_PORT`    | 3000    | Open WebUI browser port         |
-| `PODMAN_CPUS`   | 4       | VM CPU count                    |
-| `PODMAN_MEMORY` | 4096    | VM memory (MB)                  |
+You can also override per-run via env vars:
+
+```bash
+WEBUI_PORT=8080 ./local-ai.sh install
+```
+
+| Variable        | Default                    | Purpose                         |
+| --------------- | -------------------------- | ------------------------------- |
+| `LMS_PORT`      | 1234                       | LM Studio OpenAI-compatible API |
+| `WEBUI_PORT`    | 3000                       | Open WebUI browser port         |
+| `MODEL_ID`      | google/gemma-4-26b-a4b     | Model to auto-download          |
+| `PODMAN_CPUS`   | 6                          | VM CPU count                    |
+| `PODMAN_MEMORY` | 4096                       | VM memory (MB)                  |
 
 ## Recommended LM Studio Model Params (Gemma 4)
 
@@ -56,7 +81,7 @@ Set once in Open WebUI → Admin Panel → Models → `google/gemma-4-26b-a4b` �
 - Top-P: 0.95
 - Top-K: 64
 - Repeat Penalty: 1.0 (disabled)
-- Context Length: 65536
+- Context Length: 131072 (Gemma 4 maximum — reduce to 65536 if you experience slowness)
 
 These are Google's official defaults. Do **not** apply Llama-style sampling.
 
@@ -91,6 +116,8 @@ Open WebUI JIT-loads the model on first chat request. No model is held in RAM un
 - WebUI auth is enabled by default (`WEBUI_AUTH=true`)
 - No telemetry — disable it in LM Studio settings manually on first launch
 - Model files live under `~/.lmstudio/models/`, WebUI data in Podman volume `open-webui`
+- Logs persist in `~/.local/share/local-ai/logs/` (survive reboots for audit trail)
+- Regular backups: `./local-ai.sh backup` — stores chats, settings, and uploaded documents
 - For full audit: pair with outbound firewall (Little Snitch / LuLu) blocking the LM Studio helper process
 
 ## Contributing
@@ -105,4 +132,5 @@ PRs welcome. Keep changes idempotent — the script must survive being re-run. T
 
 ## Changelog
 
-- **1.0.0** — Initial release: LM Studio + Open WebUI dev + Podman + launchd
+- **1.1.0** — Stable image, auto model download, persistent logs, backup/restore, optimized resources
+- **1.0.0** — Initial release: LM Studio + Open WebUI + Podman + launchd
