@@ -23,10 +23,6 @@ readonly SCRIPT_VERSION="2.0.0"
 readonly CONFIG_DIR="${HOME}/.config/local-ai"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
 
-# Source user config file if it exists (overrides defaults via env vars)
-# shellcheck disable=SC1090
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
-
 # Ports
 readonly OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 readonly WEBUI_PORT="${WEBUI_PORT:-3000}"
@@ -257,6 +253,18 @@ check_prerequisites() {
   success "All prerequisites present"
 }
 
+
+# ---------- Stop Ollama ----------
+stop_ollama_listener() {
+  local pid=""
+  pid="$(lsof -nP -iTCP:"$OLLAMA_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
+
+  if [[ -n "$pid" ]] && ps -p "$pid" -o comm= 2>/dev/null | grep -q 'ollama'; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+}
+
 # ---------- Install steps ----------
 download_embedding_model() {
   step "Checking embedding model: $EMBEDDING_MODEL"
@@ -419,7 +427,7 @@ setup_container() {
     --restart=always \
     --security-opt no-new-privileges \
     --cap-drop all \
-    -p "$WEBUI_PORT:8080" \
+	-p "127.0.0.1:$WEBUI_PORT:8080" \
     "${webui_env[@]}" \
     -v "$WEBUI_VOLUME:/app/backend/data" \
     "$WEBUI_IMAGE" >/dev/null
@@ -573,8 +581,7 @@ EOF
 
   # Stop any foreground `ollama serve` started by ensure_ollama_running
   # so launchd can bind the port without a conflict.
-  pkill -f "ollama serve" 2>/dev/null || true
-  sleep 1
+  stop_ollama_listener
 
   for plist in "$OLLAMA_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
     launchctl unload "$plist" 2>/dev/null || true
@@ -784,7 +791,7 @@ cmd_stop() {
   info "Podman machine stopped"
 
   # Stop Ollama (also unloads any loaded models from RAM)
-  pkill -f "ollama serve" 2>/dev/null || true
+  stop_ollama_listener
   info "Ollama stopped (models unloaded from RAM)"
 
   success "Stack stopped — all resources freed"
