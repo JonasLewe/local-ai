@@ -916,7 +916,8 @@ cmd_doctor() {
   echo
   info "Checking port conflicts..."
   for port in "$OLLAMA_PORT" "$WEBUI_PORT"; do
-    local pid; pid=$(lsof -ti ":$port" 2>/dev/null | head -1)
+    # lsof exits 1 when no process is listening, which is expected here.
+    local pid; pid=$(lsof -ti ":$port" 2>/dev/null | head -1 || true)
     if [[ -n "$pid" ]]; then
       local proc; proc=$(ps -p "$pid" -o comm= 2>/dev/null)
       info "  Port $port: in use by $proc (pid $pid)"

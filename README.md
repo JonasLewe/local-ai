@@ -195,6 +195,7 @@ LM Studio app and downloaded models are not touched — you can keep or remove t
 PRs welcome. Keep changes idempotent — the script must survive being re-run. Test with:
 
 ```bash
+./tests/run-tests.sh
 ./local-ai.sh uninstall --purge
 ./local-ai.sh install
 ./local-ai.sh status
