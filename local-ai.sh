@@ -418,23 +418,30 @@ cmd_install() {
   install_script
   install_shell_aliases
 
+  # SAFETY: verify enough RAM before pre-loading the model
+  check_no_competing_servers
+  preflight_memory_check "$MODEL_SIZE_GB"
+
   # Pre-load model so first chat is instant
   step "Pre-loading model"
-  local lms="$HOME/.lmstudio/bin/lms"
-  info "Loading $MODEL_ID into RAM (~20s)..."
-  "$lms" load "$MODEL_ID" -y 2>/dev/null || warn "Could not pre-load — first chat will trigger load"
+  info "Loading $MODEL_ID into RAM..."
+  if ollama run "$MODEL_ID" "" </dev/null >/dev/null 2>&1; then
+    success "Model loaded and ready"
+  else
+    warn "Could not pre-load — first chat will trigger the load"
+  fi
 
   step "Done!"
   echo
   success "Open WebUI:  $WEBUI_URL"
-  success "LM Studio:   http://localhost:$LMS_PORT/v1"
+  success "Ollama API:  http://localhost:$OLLAMA_PORT"
   echo
   info "First-time browser setup: create admin account, then select model in chat."
   echo
   info "Quick reference (open new shell first):"
   info "  ai           → Open chat in browser"
   info "  ai-stop      → Stop stack, free all resources"
-  info "  ai-start     → Start stack again"
+  info "  ai-start     → Start stack again (with safety check)"
   info "  ai-status    → Health check"
 }
 
@@ -455,9 +462,9 @@ cmd_stop() {
   podman machine stop 2>/dev/null || true
   info "Podman machine stopped"
 
-  # Stop LM Studio
-  "$HOME/.lmstudio/bin/lms" server stop 2>/dev/null || true
-  info "LM Studio stopped"
+  # Stop Ollama (also unloads any loaded models from RAM)
+  pkill -f "ollama serve" 2>/dev/null || true
+  info "Ollama stopped (models unloaded from RAM)"
 
   success "Stack stopped — all resources freed"
   info "Run '$0 start' to bring it back up"
@@ -465,7 +472,10 @@ cmd_stop() {
 
 cmd_start() {
   step "Starting Local AI stack"
-  local lms="$HOME/.lmstudio/bin/lms"
+
+  # SAFETY: refuse to start if other model servers would compete for RAM
+  check_no_competing_servers
+  preflight_memory_check "$MODEL_SIZE_GB"
 
   # Reload launch agents
   for plist in "$OLLAMA_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
@@ -477,22 +487,22 @@ cmd_start() {
     fi
   done
 
-  # Wait for LM Studio server to be reachable
-  info "Waiting for LM Studio server..."
+  # Wait for Ollama to be reachable
+  info "Waiting for Ollama server..."
   for i in {1..15}; do
-    curl -s --max-time 2 "http://localhost:$LMS_PORT/v1/models" >/dev/null 2>&1 && break
+    curl -s --max-time 2 "http://localhost:$OLLAMA_PORT/api/tags" >/dev/null 2>&1 && break
     sleep 2
   done
 
-  if curl -s --max-time 2 "http://localhost:$LMS_PORT/v1/models" >/dev/null 2>&1; then
-    success "LM Studio online"
+  if curl -s --max-time 2 "http://localhost:$OLLAMA_PORT/api/tags" >/dev/null 2>&1; then
+    success "Ollama online"
   else
-    warn "LM Studio not responding yet — model pre-load skipped"
+    warn "Ollama not responding yet — model pre-load skipped"
   fi
 
   # Pre-load model so first chat response is instant
   info "Pre-loading model: $MODEL_ID..."
-  if "$lms" load "$MODEL_ID" -y 2>/dev/null; then
+  if ollama run "$MODEL_ID" "" </dev/null >/dev/null 2>&1; then
     success "Model loaded and ready"
   else
     warn "Could not pre-load model — first chat will be slow (~20s)"
