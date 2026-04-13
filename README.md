@@ -28,7 +28,7 @@ After install, open the URL shown (default `http://localhost:3000`), create the 
 | `./local-ai.sh install`    | First-time setup: download/import model, start Ollama, Podman, container, install launch agents |
 | `./local-ai.sh start`      | Start all services (with safety check — refuses if not enough RAM)                              |
 | `./local-ai.sh stop`       | Stop all services and free RAM + CPU                                                            |
-| `./local-ai.sh update`     | Pull latest stable Open WebUI image, restart container                                          |
+| `./local-ai.sh update`     | Pull configured Open WebUI image, restart container                                              |
 | `./local-ai.sh status`     | Health check all components, show available memory                                              |
 | `./local-ai.sh doctor`     | Diagnose common problems (memory, ports, logs, connections)                                     |
 | `./local-ai.sh logs`       | Tail all logs simultaneously                                                                    |
@@ -65,10 +65,15 @@ vi ~/.config/local-ai/config
 | `WEBUI_HOSTNAME`          | `localhost`        | Custom hostname (e.g. `ai.local`)                      |
 | `WEBUI_PORT`              | `3000`             | Open WebUI port (use `80` with custom hostname for clean URL) |
 | `OLLAMA_PORT`             | `11434`            | Ollama API port                                        |
-| `OLLAMA_FLASH_ATTENTION`  | `0`                | Set `1` for faster inference + smaller KV cache        |
-| `OLLAMA_KV_CACHE_TYPE`    | `f16`              | Set `q8_0` to halve KV cache RAM (recommended)         |
+| `WEBUI_IMAGE`             | `ghcr.io/open-webui/open-webui:latest` | Open WebUI image tag/digest (pin in regulated envs) |
+| `OLLAMA_FLASH_ATTENTION`  | `1`                | Faster inference on Apple Silicon                      |
+| `OLLAMA_KV_CACHE_TYPE`    | `q8_0`             | Lower KV cache RAM use (recommended for 32 GB)         |
+| `OLLAMA_KEEP_ALIVE`       | `24h`              | Keeps model loaded in RAM for low first-token latency  |
+| `OLLAMA_MAX_LOADED_MODELS`| `1`                | Prevents loading multiple large models at once         |
+| `OLLAMA_NUM_PARALLEL`     | `1`                | Best latency for single-user interactive workloads      |
 | `PODMAN_CPUS`             | `6`                | Podman VM CPU count                                    |
 | `PODMAN_MEMORY`           | `4096`             | Podman VM memory in MB                                 |
+| `RERANKING_MODEL`         | (empty)            | Optional reranker (`BAAI/bge-reranker-v2-m3`)           |
 
 ### Recommended settings for Gemma 4 on M1 Max 32 GB
 
@@ -77,9 +82,22 @@ MODEL_ID="gemma4-26b"
 MODEL_CONTEXT_LENGTH="65536"
 OLLAMA_FLASH_ATTENTION="1"
 OLLAMA_KV_CACHE_TYPE="q8_0"
+OLLAMA_KEEP_ALIVE="24h"
+OLLAMA_MAX_LOADED_MODELS="1"
+OLLAMA_NUM_PARALLEL="1"
 ```
 
 This gets you a 64K context window with the model fitting comfortably in RAM alongside macOS and Open WebUI.
+
+### Optional reranker (better RAG precision, one-time external download)
+
+By default, reranking is disabled to keep runtime strictly local-only.
+
+```bash
+RERANKING_MODEL="BAAI/bge-reranker-v2-m3"
+```
+
+Enabling this may trigger a one-time HuggingFace model download from inside the Open WebUI container.
 
 ### Importing existing GGUF files (no re-download)
 
@@ -166,6 +184,7 @@ LM Studio app and downloaded models are not touched — you can keep or remove t
 - Ollama binds to `127.0.0.1` only (localhost) via `OLLAMA_HOST` env in launchd plist
 - WebUI auth is enabled by default (`WEBUI_AUTH=true`)
 - OpenAI API integration disabled (`ENABLE_OPENAI_API=false`) — Ollama-only
+- Open WebUI runs with reduced container privileges (`--security-opt no-new-privileges`, `--cap-drop all`)
 - Model files live under `~/.ollama/models/`, WebUI data in Podman volume `open-webui`
 - Logs persist in `~/.local/share/local-ai/logs/` (survive reboots for audit trail)
 - Regular backups: `./local-ai.sh backup` — stores chats, settings, and uploaded documents

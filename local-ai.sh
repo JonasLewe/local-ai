@@ -33,7 +33,8 @@ readonly WEBUI_PORT="${WEBUI_PORT:-3000}"
 readonly WEBUI_HOSTNAME="${WEBUI_HOSTNAME:-localhost}"
 
 # Container
-readonly WEBUI_IMAGE="ghcr.io/open-webui/open-webui:latest"
+# In regulated environments, pin this to a version/digest instead of `latest`.
+readonly WEBUI_IMAGE="${WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:latest}"
 readonly WEBUI_CONTAINER="open-webui"
 readonly WEBUI_VOLUME="open-webui"
 
@@ -47,18 +48,21 @@ readonly MODEL_SIZE_GB="${MODEL_SIZE_GB:-16}"
 # 32768 is a safe default on 32GB systems with q8_0 KV cache + flash attention.
 readonly MODEL_CONTEXT_LENGTH="${MODEL_CONTEXT_LENGTH:-32768}"
 
-# Ollama runtime tuning (conservative defaults — opt-in for aggressive)
-readonly OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-0}"
-readonly OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-f16}"
+# Ollama runtime tuning (optimized defaults for Apple Silicon 32GB systems)
+readonly OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
+readonly OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
+readonly OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-24h}"
+readonly OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
+readonly OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 
 # --- RAG / Document search defaults ---
 # bge-m3: multilingual (100+ langs incl. strong German), 8K ctx, 1.2GB — best
 # general-purpose embedding for mixed-language document collections.
 # Alternative: "nomic-embed-text" (English-first, 274MB, faster).
 readonly EMBEDDING_MODEL="${EMBEDDING_MODEL:-bge-m3}"
-# Reranker re-scores the top-K vector hits for much better retrieval precision.
-# Downloaded from HuggingFace on first use (~500MB, cached in container).
-readonly RERANKING_MODEL="${RERANKING_MODEL:-BAAI/bge-reranker-v2-m3}"
+# Reranker is disabled by default for strict local-only operation.
+# Set this to e.g. BAAI/bge-reranker-v2-m3 if you accept one-time HF download.
+readonly RERANKING_MODEL="${RERANKING_MODEL:-}"
 readonly RAG_TOP_K="${RAG_TOP_K:-20}"
 readonly RAG_TOP_K_RERANKER="${RAG_TOP_K_RERANKER:-5}"
 readonly RAG_CHUNK_SIZE="${RAG_CHUNK_SIZE:-1500}"
@@ -222,11 +226,14 @@ ensure_ollama_running() {
     OLLAMA_HOST="127.0.0.1:$OLLAMA_PORT" \
     OLLAMA_FLASH_ATTENTION="$OLLAMA_FLASH_ATTENTION" \
     OLLAMA_KV_CACHE_TYPE="$OLLAMA_KV_CACHE_TYPE" \
+    OLLAMA_KEEP_ALIVE="$OLLAMA_KEEP_ALIVE" \
+    OLLAMA_MAX_LOADED_MODELS="$OLLAMA_MAX_LOADED_MODELS" \
+    OLLAMA_NUM_PARALLEL="$OLLAMA_NUM_PARALLEL" \
     ollama serve >>"$LOG_OLLAMA" 2>>"$LOG_OLLAMA_ERR" &
   disown 2>/dev/null || true
 
-  local i
-  for i in {1..20}; do
+  local _
+  for _ in {1..20}; do
     if curl -sf --max-time 1 "http://127.0.0.1:$OLLAMA_PORT/api/tags" >/dev/null 2>&1; then
       success "Ollama server reachable on 127.0.0.1:$OLLAMA_PORT"
       return 0
@@ -253,7 +260,7 @@ check_prerequisites() {
 # ---------- Install steps ----------
 download_embedding_model() {
   step "Checking embedding model: $EMBEDDING_MODEL"
-  if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$EMBEDDING_MODEL\(:latest\)\?"; then
+  if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -Eq "^(${EMBEDDING_MODEL}|${EMBEDDING_MODEL}:latest)$"; then
     success "Embedding model '$EMBEDDING_MODEL' already available"
     return
   fi
@@ -268,9 +275,7 @@ download_embedding_model() {
 download_model() {
   step "Checking model: $MODEL_ID"
 
-  local already_present=0
-  if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$MODEL_ID\(:latest\)\?"; then
-    already_present=1
+  if ollama list 2>/dev/null | awk 'NR>1 {print $1}' | grep -Eq "^(${MODEL_ID}|${MODEL_ID}:latest)$"; then
 
     # Check whether the existing model's num_ctx matches the configured value.
     # If it does, skip re-import. If not, rebuild the Modelfile with the new ctx.
@@ -383,22 +388,39 @@ setup_container() {
   fi
 
   info "Creating container..."
+  local -a webui_env=(
+    -e OLLAMA_BASE_URL="http://host.containers.internal:$OLLAMA_PORT"
+    -e WEBUI_AUTH=true
+    -e ENABLE_OPENAI_API=false
+    -e RAG_EMBEDDING_ENGINE=ollama
+    -e RAG_EMBEDDING_MODEL="$EMBEDDING_MODEL"
+    -e RAG_OLLAMA_BASE_URL="http://host.containers.internal:$OLLAMA_PORT"
+    -e RAG_TOP_K="$RAG_TOP_K"
+    -e CHUNK_SIZE="$RAG_CHUNK_SIZE"
+    -e CHUNK_OVERLAP="$RAG_CHUNK_OVERLAP"
+  )
+
+  if [[ -n "$RERANKING_MODEL" ]]; then
+    webui_env+=(
+      -e ENABLE_RAG_HYBRID_SEARCH=true
+      -e RAG_RERANKING_MODEL="$RERANKING_MODEL"
+      -e RAG_TOP_K_RERANKER="$RAG_TOP_K_RERANKER"
+    )
+  else
+    webui_env+=(
+      -e ENABLE_RAG_HYBRID_SEARCH=false
+      -e RAG_TOP_K_RERANKER=0
+    )
+    info "Reranker disabled (strict-local default). Set RERANKING_MODEL to enable."
+  fi
+
   podman run -d \
     --name "$WEBUI_CONTAINER" \
     --restart=always \
+    --security-opt no-new-privileges \
+    --cap-drop all \
     -p "$WEBUI_PORT:8080" \
-    -e OLLAMA_BASE_URL="http://host.containers.internal:$OLLAMA_PORT" \
-    -e WEBUI_AUTH=true \
-    -e ENABLE_OPENAI_API=false \
-    -e RAG_EMBEDDING_ENGINE=ollama \
-    -e RAG_EMBEDDING_MODEL="$EMBEDDING_MODEL" \
-    -e RAG_OLLAMA_BASE_URL="http://host.containers.internal:$OLLAMA_PORT" \
-    -e ENABLE_RAG_HYBRID_SEARCH=true \
-    -e RAG_RERANKING_MODEL="$RERANKING_MODEL" \
-    -e RAG_TOP_K="$RAG_TOP_K" \
-    -e RAG_TOP_K_RERANKER="$RAG_TOP_K_RERANKER" \
-    -e CHUNK_SIZE="$RAG_CHUNK_SIZE" \
-    -e CHUNK_OVERLAP="$RAG_CHUNK_OVERLAP" \
+    "${webui_env[@]}" \
     -v "$WEBUI_VOLUME:/app/backend/data" \
     "$WEBUI_IMAGE" >/dev/null
 
@@ -413,8 +435,8 @@ configure_webui_rag() {
   step "Applying RAG configuration to Open WebUI"
 
   # Wait for sqlite config row to exist (fresh installs init it on first boot)
-  local i
-  for i in {1..30}; do
+  local _
+  for _ in {1..30}; do
     if podman exec "$WEBUI_CONTAINER" test -s /app/backend/data/webui.db 2>/dev/null \
       && podman exec "$WEBUI_CONTAINER" python3 -c "
 import sqlite3
@@ -444,13 +466,18 @@ rag = cfg.setdefault("rag", {})
 rag.update({
     "embedding_engine": "ollama",
     "embedding_model": "$EMBEDDING_MODEL",
-    "enable_hybrid_search": True,
-    "reranking_model": "$RERANKING_MODEL",
     "top_k": $RAG_TOP_K,
-    "top_k_reranker": $RAG_TOP_K_RERANKER,
     "chunk_size": $RAG_CHUNK_SIZE,
     "chunk_overlap": $RAG_CHUNK_OVERLAP,
 })
+if "$RERANKING_MODEL":
+    rag["enable_hybrid_search"] = True
+    rag["reranking_model"] = "$RERANKING_MODEL"
+    rag["top_k_reranker"] = $RAG_TOP_K_RERANKER
+else:
+    rag["enable_hybrid_search"] = False
+    rag["top_k_reranker"] = 0
+    rag.pop("reranking_model", None)
 # Ensure Ollama endpoint is set for embeddings
 rag.setdefault("ollama", {})["url"] = "http://host.containers.internal:$OLLAMA_PORT"
 c.execute("UPDATE config SET data = ? WHERE id = ?", (json.dumps(cfg), cfg_id))
@@ -494,6 +521,9 @@ install_launch_agents() {
     <key>OLLAMA_HOST</key><string>127.0.0.1:$OLLAMA_PORT</string>
     <key>OLLAMA_FLASH_ATTENTION</key><string>$OLLAMA_FLASH_ATTENTION</string>
     <key>OLLAMA_KV_CACHE_TYPE</key><string>$OLLAMA_KV_CACHE_TYPE</string>
+    <key>OLLAMA_KEEP_ALIVE</key><string>$OLLAMA_KEEP_ALIVE</string>
+    <key>OLLAMA_MAX_LOADED_MODELS</key><string>$OLLAMA_MAX_LOADED_MODELS</string>
+    <key>OLLAMA_NUM_PARALLEL</key><string>$OLLAMA_NUM_PARALLEL</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -642,12 +672,19 @@ MODEL_GGUF_PATH=""
 WEBUI_HOSTNAME="localhost"
 WEBUI_PORT="3000"
 OLLAMA_PORT="11434"
+# Pin this in regulated environments (tag or digest) instead of relying on latest.
+WEBUI_IMAGE="ghcr.io/open-webui/open-webui:latest"
 
-# Ollama runtime tuning (defaults are safe — opt-in to aggressive settings)
-# OLLAMA_FLASH_ATTENTION=1 enables faster attention but uses more RAM.
-# OLLAMA_KV_CACHE_TYPE=q8_0 halves KV-cache memory at small quality cost.
-OLLAMA_FLASH_ATTENTION="0"
-OLLAMA_KV_CACHE_TYPE="f16"
+# Ollama runtime tuning for Apple Silicon 32GB:
+# Flash Attention + q8_0 KV cache is the best throughput/memory balance.
+OLLAMA_FLASH_ATTENTION="1"
+OLLAMA_KV_CACHE_TYPE="q8_0"
+# Keep model in RAM for fast first-token latency.
+OLLAMA_KEEP_ALIVE="24h"
+# Prevent accidental double-loading of multiple large models.
+OLLAMA_MAX_LOADED_MODELS="1"
+# Single interactive session gets best latency with parallel=1.
+OLLAMA_NUM_PARALLEL="1"
 
 # Podman VM resources (adjust for your hardware)
 PODMAN_CPUS="6"
@@ -658,9 +695,9 @@ PODMAN_MEMORY="4096"
 # strong German); nomic-embed-text is lighter (274MB) but English-first.
 EMBEDDING_MODEL="bge-m3"
 
-# Reranker — re-scores the top vector hits for much better retrieval precision.
-# ~500MB, downloaded from HuggingFace on first RAG query, then cached locally.
-RERANKING_MODEL="BAAI/bge-reranker-v2-m3"
+# Reranker is disabled by default for strict local-only operation.
+# Set to e.g. BAAI/bge-reranker-v2-m3 if you accept one-time HuggingFace download.
+RERANKING_MODEL=""
 
 # Retrieval tuning: vector search pulls TOP_K candidates, reranker picks the
 # best TOP_K_RERANKER from those. Raising TOP_K improves recall, costs latency.
@@ -773,7 +810,7 @@ cmd_start() {
 
   # Wait for Ollama to be reachable
   info "Waiting for Ollama server..."
-  for i in {1..15}; do
+  for _ in {1..15}; do
     curl -s --max-time 2 "http://localhost:$OLLAMA_PORT/api/tags" >/dev/null 2>&1 && break
     sleep 2
   done
@@ -809,7 +846,7 @@ cmd_update() {
   step "Updating Open WebUI"
   podman pull "$WEBUI_IMAGE"
   podman restart "$WEBUI_CONTAINER"
-  success "Restarted with latest stable image"
+  success "Restarted with configured image: $WEBUI_IMAGE"
 }
 
 cmd_status() {
@@ -901,6 +938,13 @@ cmd_doctor() {
   podman system connection list 2>&1 | sed 's/^/  /'
 
   echo
+  if [[ -n "$RERANKING_MODEL" ]]; then
+    warn "Reranker enabled ($RERANKING_MODEL): first RAG use may trigger HuggingFace download."
+  else
+    info "Reranker disabled: no HuggingFace download during RAG."
+  fi
+
+  echo
   info "Disk space:"
   df -h / | tail -1 | sed 's/^/  /'
 }
@@ -987,7 +1031,7 @@ Usage:
   $0 install              First-time setup (incl. model download)
   $0 start                Start all services
   $0 stop                 Stop all services (frees RAM + CPU)
-  $0 update               Pull latest stable Open WebUI image
+  $0 update               Pull configured Open WebUI image
   $0 status               Health check
   $0 doctor               Diagnose problems
   $0 logs                 Tail all logs
@@ -999,9 +1043,13 @@ Environment variables (all overridable via config file):
   MODEL_ID=$MODEL_ID                Ollama model to use
   MODEL_SIZE_GB=$MODEL_SIZE_GB                       Estimated size for safety check
   MODEL_GGUF_PATH=...               Optional: import GGUF instead of pulling
+  WEBUI_IMAGE=$WEBUI_IMAGE         Open WebUI image tag/digest
   WEBUI_HOSTNAME=$WEBUI_HOSTNAME       Custom hostname (e.g. ai.local)
   WEBUI_PORT=$WEBUI_PORT                  Open WebUI port (80 for clean URL)
   OLLAMA_PORT=$OLLAMA_PORT             Ollama API port
+  OLLAMA_KEEP_ALIVE=$OLLAMA_KEEP_ALIVE         Keep model in RAM between requests
+  OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS   Max concurrently loaded models
+  OLLAMA_NUM_PARALLEL=$OLLAMA_NUM_PARALLEL           Concurrent requests per model
   PODMAN_CPUS=$PODMAN_CPUS                   Podman machine CPU count
   PODMAN_MEMORY=$PODMAN_MEMORY             Podman machine memory (MB)
 
