@@ -252,23 +252,30 @@ install_launch_agents() {
   mkdir -p "$LAUNCH_AGENTS_DIR"
 
   local podman_bin; podman_bin="$(which podman)"
+  local ollama_bin; ollama_bin="$(which ollama)"
 
-  # --- LM Studio server ---
-  cat > "$LMS_PLIST" <<EOF
+  # --- Ollama server ---
+  cat > "$OLLAMA_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>ai.lmstudio.server</string>
+  <key>Label</key><string>ai.ollama.server</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string><string>-lc</string>
-    <string>$HOME/.lmstudio/bin/lms server start --port $LMS_PORT</string>
+    <string>$ollama_bin serve</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OLLAMA_HOST</key><string>127.0.0.1:$OLLAMA_PORT</string>
+    <key>OLLAMA_FLASH_ATTENTION</key><string>$OLLAMA_FLASH_ATTENTION</string>
+    <key>OLLAMA_KV_CACHE_TYPE</key><string>$OLLAMA_KV_CACHE_TYPE</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$LOG_LMS</string>
-  <key>StandardErrorPath</key><string>$LOG_LMS_ERR</string>
+  <key>StandardOutPath</key><string>$LOG_OLLAMA</string>
+  <key>StandardErrorPath</key><string>$LOG_OLLAMA_ERR</string>
 </dict>
 </plist>
 EOF
@@ -311,7 +318,7 @@ EOF
 </plist>
 EOF
 
-  for plist in "$LMS_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
+  for plist in "$OLLAMA_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
     launchctl unload "$plist" 2>/dev/null || true
     launchctl load   "$plist"
   done
@@ -435,7 +442,7 @@ cmd_stop() {
   step "Stopping Local AI stack"
 
   # Unload launch agents so they don't auto-restart
-  for plist in "$WEBUI_PLIST" "$PODMAN_PLIST" "$LMS_PLIST"; do
+  for plist in "$WEBUI_PLIST" "$PODMAN_PLIST" "$OLLAMA_PLIST"; do
     launchctl unload "$plist" 2>/dev/null || true
   done
   info "Launch agents unloaded (no auto-restart)"
@@ -461,7 +468,7 @@ cmd_start() {
   local lms="$HOME/.lmstudio/bin/lms"
 
   # Reload launch agents
-  for plist in "$LMS_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
+  for plist in "$OLLAMA_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
     if [[ -f "$plist" ]]; then
       launchctl load "$plist" 2>/dev/null || true
     else
@@ -603,7 +610,7 @@ cmd_uninstall() {
   read -r -p "Continue? [y/N] " ans
   [[ "$ans" =~ ^[Yy]$ ]] || { info "Aborted"; exit 0; }
 
-  for plist in "$LMS_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
+  for plist in "$OLLAMA_PLIST" "$PODMAN_PLIST" "$WEBUI_PLIST"; do
     launchctl unload "$plist" 2>/dev/null || true
     rm -f "$plist"
   done
