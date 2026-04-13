@@ -59,9 +59,9 @@ vi ~/.config/local-ai/config
 | Variable                  | Default            | Purpose                                                |
 | ------------------------- | ------------------ | ------------------------------------------------------ |
 | `MODEL_ID`                | `gemma4-26b`       | Ollama model name (any from <https://ollama.com/library>) |
-| `MODEL_SIZE_GB`           | `16`               | Estimated model size — used by RAM safety check        |
 | `MODEL_CONTEXT_LENGTH`    | `32768`            | Context window in tokens (4K default in Ollama is too small) |
 | `MODEL_GGUF_PATH`         | (empty)            | Optional: import existing GGUF instead of pulling      |
+| `MODEL_SIZE_GB`           | `16`               | Optional fallback — script auto-detects from `ollama list` or GGUF |
 | `WEBUI_HOSTNAME`          | `localhost`        | Custom hostname (e.g. `ai.local`)                      |
 | `WEBUI_PORT`              | `3000`             | Open WebUI port (use `80` with custom hostname for clean URL) |
 | `OLLAMA_PORT`             | `11434`            | Ollama API port                                        |
