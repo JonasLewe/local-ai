@@ -1,0 +1,68 @@
+# Local AI Configuration
+# Edit these values, then re-run: local-ai install
+# Changes take effect on next install/restart.
+
+# Model to use (Ollama naming, e.g. "gemma4-26b" or "llama3.1:8b")
+# Browse models at https://ollama.com/library
+MODEL_ID="gemma4-26b"
+
+# Optional: fallback model size in GB if auto-detection fails.
+# Normally not needed — script reads actual size from `ollama list` or GGUF file.
+MODEL_SIZE_GB="16"
+
+# Context length in tokens. Larger = more document/conversation history,
+# but uses more KV-cache RAM. Safe ranges on 32GB:
+#   8192   — minimal
+#   32768  — recommended balance
+#   65536  — only with q8_0 KV cache + flash attention
+MODEL_CONTEXT_LENGTH="32768"
+
+# Optional: import an existing GGUF file instead of pulling from Ollama registry.
+# Useful if you already have models from LM Studio or HuggingFace.
+# Leave empty to pull from the registry.
+MODEL_GGUF_PATH=""
+
+# Web UI access
+# Set WEBUI_HOSTNAME to a custom name (e.g. "ai.local") for a friendly URL.
+# The script will add it to /etc/hosts automatically (requires sudo once).
+# Set WEBUI_PORT to 80 for a clean URL without port number.
+WEBUI_HOSTNAME="localhost"
+WEBUI_PORT="3000"
+OLLAMA_PORT="11434"
+# Pin this in regulated environments (tag or digest) instead of relying on latest.
+WEBUI_IMAGE="ghcr.io/open-webui/open-webui:latest"
+
+# Ollama runtime tuning for Apple Silicon 32GB:
+# Flash Attention + q8_0 KV cache is the best throughput/memory balance.
+OLLAMA_FLASH_ATTENTION="1"
+OLLAMA_KV_CACHE_TYPE="q8_0"
+# Keep model in RAM for fast first-token latency.
+OLLAMA_KEEP_ALIVE="24h"
+# Allow chat model + embedding model to stay loaded simultaneously.
+# 16GB (gemma4) + 1.2GB (bge-m3) + ~4GB OS = ~21GB — fits in 32GB.
+OLLAMA_MAX_LOADED_MODELS="2"
+# Single interactive session gets best latency with parallel=1.
+OLLAMA_NUM_PARALLEL="1"
+
+# Podman VM resources (adjust for your hardware)
+PODMAN_CPUS="6"
+PODMAN_MEMORY="4096"
+
+# --- RAG / Document search (Knowledge Bases in Open WebUI) ---
+# Embedding model for document chunks. bge-m3 is multilingual (100+ langs,
+# strong German); nomic-embed-text is lighter (274MB) but English-first.
+EMBEDDING_MODEL="bge-m3"
+
+# Reranker is disabled by default for strict local-only operation.
+# Set to e.g. BAAI/bge-reranker-v2-m3 if you accept one-time HuggingFace download.
+RERANKING_MODEL=""
+
+# Retrieval tuning: vector search pulls TOP_K candidates, reranker picks the
+# best TOP_K_RERANKER from those. Raising TOP_K improves recall, costs latency.
+RAG_TOP_K="20"
+RAG_TOP_K_RERANKER="5"
+
+# Chunk size / overlap for document splitting. 1500/200 works well for typical
+# PDFs and docs. Smaller chunks = more precise retrieval, more re-ranker work.
+RAG_CHUNK_SIZE="1500"
+RAG_CHUNK_OVERLAP="200"

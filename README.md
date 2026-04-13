@@ -49,10 +49,10 @@ After install, these shell aliases are available (open new terminal first):
 
 ## Configuration
 
-All settings live in `~/.config/local-ai/config` (created automatically on first install). Edit the file and re-run `./local-ai.sh install` (or just `./local-ai.sh start`) to apply changes.
+All settings live in `./config` in the repo directory (created from `templates/config.default` on first install). Edit and re-run `./local-ai.sh install` (or just `./local-ai.sh start`) to apply changes.
 
 ```bash
-vi ~/.config/local-ai/config
+vi config
 ./local-ai.sh start
 ```
 
@@ -69,7 +69,7 @@ vi ~/.config/local-ai/config
 | `OLLAMA_FLASH_ATTENTION`  | `1`                | Faster inference on Apple Silicon                      |
 | `OLLAMA_KV_CACHE_TYPE`    | `q8_0`             | Lower KV cache RAM use (recommended for 32 GB)         |
 | `OLLAMA_KEEP_ALIVE`       | `24h`              | Keeps model loaded in RAM for low first-token latency  |
-| `OLLAMA_MAX_LOADED_MODELS`| `1`                | Prevents loading multiple large models at once         |
+| `OLLAMA_MAX_LOADED_MODELS`| `2`                | Chat model + embedding model loaded simultaneously     |
 | `OLLAMA_NUM_PARALLEL`     | `1`                | Best latency for single-user interactive workloads      |
 | `PODMAN_CPUS`             | `6`                | Podman VM CPU count                                    |
 | `PODMAN_MEMORY`           | `4096`             | Podman VM memory in MB                                 |
@@ -83,7 +83,7 @@ MODEL_CONTEXT_LENGTH="65536"
 OLLAMA_FLASH_ATTENTION="1"
 OLLAMA_KV_CACHE_TYPE="q8_0"
 OLLAMA_KEEP_ALIVE="24h"
-OLLAMA_MAX_LOADED_MODELS="1"
+OLLAMA_MAX_LOADED_MODELS="2"
 OLLAMA_NUM_PARALLEL="1"
 ```
 
@@ -174,7 +174,7 @@ If you ran an older version with LM Studio:
 2. Unload LM Studio: `~/.lmstudio/bin/lms unload --all && ~/.lmstudio/bin/lms server stop`
 3. Disable LM Studio auto-start: `launchctl unload ~/Library/LaunchAgents/ai.lmstudio.server.plist`
 4. Install Ollama: `brew install ollama`
-5. Update your config — see `~/.config/local-ai/config`. Set `MODEL_GGUF_PATH` to your existing LM Studio GGUF file to avoid re-downloading.
+5. Update your config — see `./config`. Set `MODEL_GGUF_PATH` to your existing LM Studio GGUF file to avoid re-downloading.
 6. Re-run install: `./local-ai.sh install`
 
 LM Studio app and downloaded models are not touched — you can keep or remove them later.

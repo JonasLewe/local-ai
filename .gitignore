@@ -1,3 +1,5 @@
 .DS_Store
 *.log
 *.swp
+# Local config (user-specific, created from templates/config.default)
+config

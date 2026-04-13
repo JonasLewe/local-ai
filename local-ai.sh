@@ -19,9 +19,13 @@
 set -euo pipefail
 
 # ---------- Configuration ----------
-readonly SCRIPT_VERSION="2.0.0"
-readonly CONFIG_DIR="${HOME}/.config/local-ai"
-readonly CONFIG_FILE="$CONFIG_DIR/config"
+readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly CONFIG_FILE="$SCRIPT_DIR/config"
+
+# Source local config (config values override defaults below)
+# shellcheck disable=SC1091
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 # Ports
 readonly OLLAMA_PORT="${OLLAMA_PORT:-11434}"
@@ -48,7 +52,7 @@ readonly MODEL_CONTEXT_LENGTH="${MODEL_CONTEXT_LENGTH:-32768}"
 readonly OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
 readonly OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
 readonly OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:-24h}"
-readonly OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-1}"
+readonly OLLAMA_MAX_LOADED_MODELS="${OLLAMA_MAX_LOADED_MODELS:-2}"
 readonly OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 
 # --- RAG / Document search defaults ---
@@ -100,6 +104,27 @@ warn()    { printf "${C_YELLOW}⚠${C_RESET}  %s\n" "$*"; }
 error()   { printf "${C_RED}✗${C_RESET}  %s\n" "$*" >&2; }
 step()    { printf "\n${C_BOLD}▶ %s${C_RESET}\n" "$*"; }
 die()     { error "$*"; exit 1; }
+
+# ---------- Template rendering ----------
+readonly TPL_DIR="$SCRIPT_DIR/templates"
+readonly SCRIPTS_DIR="$SCRIPT_DIR/scripts"
+[[ -d "$TPL_DIR" ]]     || die "Templates not found: $TPL_DIR"
+[[ -d "$SCRIPTS_DIR" ]] || die "Scripts not found: $SCRIPTS_DIR"
+
+# Replace {{VAR}} placeholders in a template file with shell variable values.
+# Only matches uppercase/underscore variable names — leaves e.g. {{.State}} alone.
+render_template() {
+  local template="$1"
+  [[ -f "$template" ]] || die "Template not found: $template"
+  local content
+  content=$(<"$template")
+  while [[ "$content" =~ \{\{([A-Za-z_][A-Za-z_0-9]*)\}\} ]]; do
+    local var="${BASH_REMATCH[1]}"
+    local val="${!var:-}"
+    content="${content//\{\{${var}\}\}/$val}"
+  done
+  printf '%s\n' "$content"
+}
 
 # ---------- Pre-flight checks ----------
 require_macos() {
@@ -299,10 +324,7 @@ download_model() {
 
     # Re-create from existing Ollama-stored model — fast, disk-only operation
     local modelfile; modelfile=$(mktemp)
-    cat > "$modelfile" <<EOF
-FROM $MODEL_ID
-PARAMETER num_ctx $MODEL_CONTEXT_LENGTH
-EOF
+    MODEL_SOURCE="$MODEL_ID" render_template "$TPL_DIR/Modelfile" > "$modelfile"
     if ollama create "$MODEL_ID" -f "$modelfile" >/dev/null; then
       success "Model '$MODEL_ID' context updated to $MODEL_CONTEXT_LENGTH tokens"
     else
@@ -320,10 +342,7 @@ EOF
     info "(no re-download — uses your local file)"
 
     local modelfile; modelfile=$(mktemp)
-    cat > "$modelfile" <<EOF
-FROM $MODEL_GGUF_PATH
-PARAMETER num_ctx $MODEL_CONTEXT_LENGTH
-EOF
+    MODEL_SOURCE="$MODEL_GGUF_PATH" render_template "$TPL_DIR/Modelfile" > "$modelfile"
 
     if ollama create "$MODEL_ID" -f "$modelfile"; then
       success "Model '$MODEL_ID' imported (context: $MODEL_CONTEXT_LENGTH tokens)"
@@ -337,10 +356,7 @@ EOF
     if ollama pull "$MODEL_ID"; then
       # Re-create with custom context length (registry default is usually 4096)
       local modelfile; modelfile=$(mktemp)
-      cat > "$modelfile" <<EOF
-FROM $MODEL_ID
-PARAMETER num_ctx $MODEL_CONTEXT_LENGTH
-EOF
+      MODEL_SOURCE="$MODEL_ID" render_template "$TPL_DIR/Modelfile" > "$modelfile"
       ollama create "${MODEL_ID}" -f "$modelfile" >/dev/null
       rm -f "$modelfile"
       success "Model '$MODEL_ID' downloaded (context: $MODEL_CONTEXT_LENGTH tokens)"
@@ -459,44 +475,16 @@ exit(0 if r[0] > 0 else 1)
   done
 
   # Patch the config row
-  local py_script; py_script=$(mktemp)
-  cat > "$py_script" <<PYEOF
-import sqlite3, json, sys
-DB = "/app/backend/data/webui.db"
-c = sqlite3.connect(DB)
-row = c.execute("SELECT id, data FROM config ORDER BY id DESC LIMIT 1").fetchone()
-if not row:
-    print("no config row yet — skipping (will apply on next install run)")
-    sys.exit(0)
-cfg_id, raw = row
-cfg = json.loads(raw)
-rag = cfg.setdefault("rag", {})
-rag.update({
-    "embedding_engine": "ollama",
-    "embedding_model": "$EMBEDDING_MODEL",
-    "top_k": $RAG_TOP_K,
-    "chunk_size": $RAG_CHUNK_SIZE,
-    "chunk_overlap": $RAG_CHUNK_OVERLAP,
-})
-if "$RERANKING_MODEL":
-    rag["enable_hybrid_search"] = True
-    rag["reranking_model"] = "$RERANKING_MODEL"
-    rag["top_k_reranker"] = $RAG_TOP_K_RERANKER
-else:
-    rag["enable_hybrid_search"] = False
-    rag["top_k_reranker"] = 0
-    rag.pop("reranking_model", None)
-# Ensure Ollama endpoint is set for embeddings
-rag.setdefault("ollama", {})["url"] = "http://host.containers.internal:$OLLAMA_PORT"
-c.execute("UPDATE config SET data = ? WHERE id = ?", (json.dumps(cfg), cfg_id))
-c.commit()
-c.close()
-print("ok")
-PYEOF
-  podman cp "$py_script" "$WEBUI_CONTAINER:/tmp/patch_rag.py" >/dev/null
-  rm -f "$py_script"
+  podman cp "$SCRIPTS_DIR/patch_rag.py" "$WEBUI_CONTAINER:/tmp/patch_rag.py" >/dev/null
 
-  if podman exec "$WEBUI_CONTAINER" python3 /tmp/patch_rag.py >/dev/null 2>&1; then
+  if podman exec "$WEBUI_CONTAINER" python3 /tmp/patch_rag.py \
+    --embedding-model "$EMBEDDING_MODEL" \
+    --ollama-url "http://host.containers.internal:$OLLAMA_PORT" \
+    --top-k "$RAG_TOP_K" \
+    --chunk-size "$RAG_CHUNK_SIZE" \
+    --chunk-overlap "$RAG_CHUNK_OVERLAP" \
+    --reranking-model "$RERANKING_MODEL" \
+    --top-k-reranker "$RAG_TOP_K_RERANKER" >/dev/null 2>&1; then
     # Restart so in-memory config is refreshed from sqlite
     podman restart "$WEBUI_CONTAINER" >/dev/null
     success "RAG config applied: $EMBEDDING_MODEL + reranker, top_k=$RAG_TOP_K/$RAG_TOP_K_RERANKER, chunks=${RAG_CHUNK_SIZE}/${RAG_CHUNK_OVERLAP}"
@@ -509,75 +497,17 @@ install_launch_agents() {
   step "Installing launchd auto-start agents"
   mkdir -p "$LAUNCH_AGENTS_DIR"
 
-  local podman_bin; podman_bin="$(which podman)"
-  local ollama_bin; ollama_bin="$(which ollama)"
+  local PODMAN_BIN; PODMAN_BIN="$(which podman)"
+  local OLLAMA_BIN; OLLAMA_BIN="$(which ollama)"
 
   # --- Ollama server ---
-  cat > "$OLLAMA_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>ai.ollama.server</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/zsh</string><string>-lc</string>
-    <string>$ollama_bin serve</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>OLLAMA_HOST</key><string>127.0.0.1:$OLLAMA_PORT</string>
-    <key>OLLAMA_FLASH_ATTENTION</key><string>$OLLAMA_FLASH_ATTENTION</string>
-    <key>OLLAMA_KV_CACHE_TYPE</key><string>$OLLAMA_KV_CACHE_TYPE</string>
-    <key>OLLAMA_KEEP_ALIVE</key><string>$OLLAMA_KEEP_ALIVE</string>
-    <key>OLLAMA_MAX_LOADED_MODELS</key><string>$OLLAMA_MAX_LOADED_MODELS</string>
-    <key>OLLAMA_NUM_PARALLEL</key><string>$OLLAMA_NUM_PARALLEL</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$LOG_OLLAMA</string>
-  <key>StandardErrorPath</key><string>$LOG_OLLAMA_ERR</string>
-</dict>
-</plist>
-EOF
+  render_template "$TPL_DIR/ai.ollama.server.plist" > "$OLLAMA_PLIST"
 
   # --- Podman machine ---
-  cat > "$PODMAN_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>io.podman.machine</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/zsh</string><string>-lc</string>
-    <string>$podman_bin machine start 2>/dev/null; exit 0</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$LOG_PODMAN</string>
-  <key>StandardErrorPath</key><string>$LOG_PODMAN</string>
-</dict>
-</plist>
-EOF
+  render_template "$TPL_DIR/io.podman.machine.plist" > "$PODMAN_PLIST"
 
   # --- Open WebUI container (waits for machine) ---
-  cat > "$WEBUI_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>ai.openwebui</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/zsh</string><string>-lc</string>
-    <string>for i in {1..60}; do $podman_bin machine inspect --format '{{.State}}' 2>/dev/null | grep -q running && break; sleep 2; done; $podman_bin start $WEBUI_CONTAINER</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$LOG_WEBUI</string>
-  <key>StandardErrorPath</key><string>$LOG_WEBUI</string>
-</dict>
-</plist>
-EOF
+  render_template "$TPL_DIR/ai.openwebui.plist" > "$WEBUI_PLIST"
 
   # Stop any foreground `ollama serve` started by ensure_ollama_running
   # so launchd can bind the port without a conflict.
@@ -595,9 +525,8 @@ install_script() {
   step "Installing script to ~/.local/bin"
   local target="$HOME/.local/bin/local-ai"
   mkdir -p "$HOME/.local/bin"
-  cp "$(realpath "$0")" "$target"
-  chmod +x "$target"
-  success "Installed to $target"
+  ln -sf "$(realpath "$0")" "$target"
+  success "Symlinked $target → $SCRIPT_DIR/local-ai.sh"
 }
 
 install_shell_aliases() {
@@ -623,101 +552,23 @@ install_shell_aliases() {
     info "Removed old aliases from $rc"
   fi
 
-  cat >> "$rc" <<EOF
-
-# --- Local AI Setup ---
-alias ai='open $WEBUI_URL'
-alias ai-start='local-ai start'
-alias ai-stop='local-ai stop'
-alias ai-status='local-ai status'
-alias ai-logs='podman logs -f $WEBUI_CONTAINER'
-alias ai-update='local-ai update'
-# --- End Local AI Setup ---
-EOF
+  printf '\n' >> "$rc"
+  render_template "$TPL_DIR/aliases.sh" >> "$rc"
 
   success "Aliases written to $rc (open new shell to use)"
 }
 
 install_config() {
   step "Setting up configuration"
-  mkdir -p "$CONFIG_DIR"
 
   if [[ -f "$CONFIG_FILE" ]]; then
     info "Config exists at $CONFIG_FILE — preserving"
     return
   fi
 
-  cat > "$CONFIG_FILE" <<'CONF'
-# Local AI Configuration
-# Edit these values, then re-run: local-ai install
-# Changes take effect on next install/restart.
+  cp "$TPL_DIR/config.default" "$CONFIG_FILE"
 
-# Model to use (Ollama naming, e.g. "gemma4-26b" or "llama3.1:8b")
-# Browse models at https://ollama.com/library
-MODEL_ID="gemma4-26b"
-
-# Optional: fallback model size in GB if auto-detection fails.
-# Normally not needed — script reads actual size from `ollama list` or GGUF file.
-MODEL_SIZE_GB="16"
-
-# Context length in tokens. Larger = more document/conversation history,
-# but uses more KV-cache RAM. Safe ranges on 32GB:
-#   8192   — minimal
-#   32768  — recommended balance
-#   65536  — only with q8_0 KV cache + flash attention
-MODEL_CONTEXT_LENGTH="32768"
-
-# Optional: import an existing GGUF file instead of pulling from Ollama registry.
-# Useful if you already have models from LM Studio or HuggingFace.
-# Leave empty to pull from the registry.
-MODEL_GGUF_PATH=""
-
-# Web UI access
-# Set WEBUI_HOSTNAME to a custom name (e.g. "ai.local") for a friendly URL.
-# The script will add it to /etc/hosts automatically (requires sudo once).
-# Set WEBUI_PORT to 80 for a clean URL without port number.
-WEBUI_HOSTNAME="localhost"
-WEBUI_PORT="3000"
-OLLAMA_PORT="11434"
-# Pin this in regulated environments (tag or digest) instead of relying on latest.
-WEBUI_IMAGE="ghcr.io/open-webui/open-webui:latest"
-
-# Ollama runtime tuning for Apple Silicon 32GB:
-# Flash Attention + q8_0 KV cache is the best throughput/memory balance.
-OLLAMA_FLASH_ATTENTION="1"
-OLLAMA_KV_CACHE_TYPE="q8_0"
-# Keep model in RAM for fast first-token latency.
-OLLAMA_KEEP_ALIVE="24h"
-# Prevent accidental double-loading of multiple large models.
-OLLAMA_MAX_LOADED_MODELS="1"
-# Single interactive session gets best latency with parallel=1.
-OLLAMA_NUM_PARALLEL="1"
-
-# Podman VM resources (adjust for your hardware)
-PODMAN_CPUS="6"
-PODMAN_MEMORY="4096"
-
-# --- RAG / Document search (Knowledge Bases in Open WebUI) ---
-# Embedding model for document chunks. bge-m3 is multilingual (100+ langs,
-# strong German); nomic-embed-text is lighter (274MB) but English-first.
-EMBEDDING_MODEL="bge-m3"
-
-# Reranker is disabled by default for strict local-only operation.
-# Set to e.g. BAAI/bge-reranker-v2-m3 if you accept one-time HuggingFace download.
-RERANKING_MODEL=""
-
-# Retrieval tuning: vector search pulls TOP_K candidates, reranker picks the
-# best TOP_K_RERANKER from those. Raising TOP_K improves recall, costs latency.
-RAG_TOP_K="20"
-RAG_TOP_K_RERANKER="5"
-
-# Chunk size / overlap for document splitting. 1500/200 works well for typical
-# PDFs and docs. Smaller chunks = more precise retrieval, more re-ranker work.
-RAG_CHUNK_SIZE="1500"
-RAG_CHUNK_OVERLAP="200"
-CONF
-
-  success "Config created: $CONFIG_FILE"
+  success "Config created: $CONFIG_FILE (edit this file to customize)"
 }
 
 # ---------- Commands ----------

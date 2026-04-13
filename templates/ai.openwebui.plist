@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.openwebui</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string><string>-lc</string>
+    <string>for i in {1..60}; do {{PODMAN_BIN}} machine inspect --format '{{.State}}' 2>/dev/null | grep -q running &amp;&amp; break; sleep 2; done; {{PODMAN_BIN}} start {{WEBUI_CONTAINER}}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{{LOG_WEBUI}}</string>
+  <key>StandardErrorPath</key><string>{{LOG_WEBUI}}</string>
+</dict>
+</plist>
